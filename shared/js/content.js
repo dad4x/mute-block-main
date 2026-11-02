@@ -2884,9 +2884,11 @@ function syncNukingControlViews() {
     }
 }
 
-// A Nuking button gets the drop-down while it reads Nuking; any other state (Queueing, Collecting, Done) removes it.
+// A Nuking button gets the drop-down while it reads Nuking; any other state (Queueing, Collecting, Done) removes it. The post buttons
+// (the post's Nuking pill and its queue button) never get it (owner, 1 Nov): the drop-down belongs to the toolbar only.
 function syncNukingControlForButton(button, label) {
-    if(nukingControlPageAllowed() && /^Nuking/.test(`${label || ''}`)) attachNukingControl(button, 0)
+    const isPostButton = !!button?.classList?.contains('mb-ext_space-feed-post-nuke-btn') || !!button?.classList?.contains('mb-ext_space-feed-post-queue-btn')
+    if(!isPostButton && nukingControlPageAllowed() && /^Nuking/.test(`${label || ''}`)) attachNukingControl(button, 0)
     else detachNukingControl(button)
 }
 
@@ -2969,6 +2971,8 @@ function setNukeButtonBadLinks(button, label = 'Bad Links') {
     button.dataset.mbNukeState = 'bad-links'
     button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done')
     button.classList.add('mb-ext_nuke-profiles-btn--bad-links')
+    // Two or more reasons stack in a taller pill (1 Nov): one line per reason, see the --stacked rule in content.css.
+    button.classList.toggle('mb-ext_nuke-profiles-btn--stacked', `${label || ''}`.includes('\n'))
     button.innerText = label
 }
 
@@ -8945,6 +8949,7 @@ function isProfileNukeRetryBlocked(href) {
 
 // Owner, 29 Oct: one line of the Bad Links list. The name and the link are the profile the queue row targeted. The reason is
 // "redirected to <name>" when Quora sent that profile to another name (the progress record keeps the landing profile), else "unavailable".
+// 1 Nov (owner): the reason is the one Quora's record holds, such as "Profile banned", rather than a word this code picks for it.
 function getSpaceFeedBadLinkDetail(href, record = null) {
     const requestedHref = normalizeQuoraProfileHref(href) || `${href || ''}`
     const name = requestedHref.split('/profile/')[1] || requestedHref
@@ -8954,8 +8959,19 @@ function getSpaceFeedBadLinkDetail(href, record = null) {
     return {
         href: requestedHref,
         name,
-        reason: redirected ? `redirected to ${landedHref.split('/profile/')[1] || landedHref}` : 'unavailable'
+        reason: redirected ? `redirected to ${landedHref.split('/profile/')[1] || landedHref}` : (record?.unavailableReason || 'unavailable')
     }
+}
+
+// The post's button carries the reasons of its failed profiles (1 Nov): one line per distinct reason, as the detail holds it, in the order
+// they first appear. Two or more lines make the taller pill (see setNukeButtonBadLinks).
+function getSpaceFeedBadLinksButtonLabel(details = []) {
+    const reasons = []
+    for(const detail of Array.isArray(details) ? details : []) {
+        const reason = `${detail?.reason || ''}`.trim() || 'unavailable'
+        if(!reasons.includes(reason)) reasons.push(reason)
+    }
+    return reasons.length ? reasons.join('\n') : 'Bad Links'
 }
 
 function isResolvableSpaceFeedEntry(entry) {
@@ -9164,7 +9180,18 @@ function buildSpaceFeedRenderEntry(entry = null, context = null) {
     const liveUrls = postNuked ? [] : getNormalizedProfileHrefList([...activePendingUrls, ...queueableUrls])
     const resolverPending = isResolvableSpaceFeedEntry(entry) &&
         (getPendingSpaceFeedIndex().resolverPostKeys.has(entry?.postKey) || isSpaceFeedResolverChaseQueued(entry))
-    const postBusy = !postNuked && (isSpaceFeedPostNuking(entry?.postKey) || isSpaceFeedPostPendingForRender(entry?.postKey || '', context))
+    // A candidate that the queue already holds is taken out of queueableUrls. When that leaves nothing to queue, the post is busy (Nuking),
+    // judged from the candidate itself, since the post key on the queue row may not match this post's key.
+    const queuedCandidateUrls = postNuked ? [] : candidateUrls.filter(url => context?.pendingCoordinatorProfileHrefs?.has(url))
+    // A resolver post whose chase is already queued is busy too (1 Nov). Its resolver stops being queueable once the chase is queued, so
+    // without this it had no controls at all: no candidates, no resolver, and not busy.
+    const chaseQueued = !postNuked && isResolvableSpaceFeedEntry(entry) && isSpaceFeedResolverChaseQueued(entry)
+    const postBusy = !postNuked && (
+        isSpaceFeedPostNuking(entry?.postKey) ||
+        isSpaceFeedPostPendingForRender(entry?.postKey || '', context) ||
+        chaseQueued ||
+        (queuedCandidateUrls.length > 0 && queueableUrls.length === 0 && !hasResolver)
+    )
     const queueableWorkCount = queueableUrls.length + (hasResolver ? 1 : 0)
     const liveWorkCount = liveUrls.length + (resolverPending ? 1 : 0)
 
@@ -9580,7 +9607,11 @@ function getSpaceFeedCitedUrl(timestamp) {
     // A question addressed as its quora.com copy ("https-www-quora-com-unanswered-<title>-ch-17-amp-oid-<oid>"). The question's log page names
     // the asker, so the chase goes there (30 Oct).
     const question = /^\/https-www-quora-com-unanswered-(.+?)(?:-ch-\d+)?(?:-amp-oid-\d+|$)/.exec(pathname)
-    return question ? `https://www.quora.com/${question[1]}/log` : ''
+    if (question) return `https://www.quora.com/${question[1]}/log`
+    // An answer addressed as "<question title>-answer-<answerer>" (1 Nov). Its question's log page is the chase URL a resolver row carries, so
+    // the post is matched to that row while the row is queued (the row's key is "resolve-profile:" plus this URL).
+    const answer = /^\/([^/]+?)-answer-[^/]+$/.exec(pathname)
+    return answer ? `https://www.quora.com/${answer[1]}/log` : ''
 }
 
 // The question a post shares, read from its question card (31 Oct). The card's link is the full question address, while the post's
@@ -11845,10 +11876,11 @@ function syncSpaceFeedPostButtons(renderModel) {
             singleButton.disabled = true
         }
         else if(hasBadLinks) {
-            setNukeButtonBadLinks(singleButton)
+            const badLinksLabel = getSpaceFeedBadLinksButtonLabel(badLinkDetails)
+            setNukeButtonBadLinks(singleButton, badLinksLabel)
             // Owner, 29 Oct: enabled, because a disabled button gets no click. The click only opens or closes the list (see the click handler).
             singleButton.disabled = false
-            setMuteBlockHelp(singleButton, `${postLabel}Bad Links: nothing here can be queued. Failed: ${badLinkDetails.map(detail => `${detail.name} (${detail.reason})`).join(', ')}. Click for the links to block by hand.`)
+            setMuteBlockHelp(singleButton, `${postLabel}${badLinksLabel}: nothing here can be queued. Failed: ${badLinkDetails.map(detail => `${detail.name} (${detail.reason})`).join(', ')}. Click for the links to block by hand.`)
         }
         else {
             setNukeButtonIdle(singleButton, 'Mute Block')

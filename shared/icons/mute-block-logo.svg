@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" fill="#ffffff"/>
+  <!-- rear loader: same height as the bin, back face leaning steeply in toward the roof -->
+  <path d="M160 100 H136 Q114 100 110 122 L78 240 H160 Z" fill="#DF3A42" stroke="#160404" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M116 150 Q108 190 116 222" fill="none" stroke="#160404" stroke-width="6" stroke-linecap="round"/>
+  <!-- bin -->
+  <rect x="160" y="100" width="124" height="140" rx="14" fill="#DF3A42" stroke="#160404" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M172 146 H272 M172 200 H272" fill="none" stroke="#160404" stroke-width="6"/>
+  <!-- chassis -->
+  <rect x="76" y="236" width="328" height="14" fill="#160404"/>
+  <!-- cab: same height as the bin, with a gap to the bin; sloped windshield, door line, mirror, grille, bumper -->
+  <polygon points="300,100 362,100 398,150 410,240 300,240" fill="#DF3A42" stroke="#160404" stroke-width="10" stroke-linejoin="round"/>
+  <polygon points="316,118 348,118 386,158 316,158" fill="#ffffff"/>
+  <path d="M340 166 V226" fill="none" stroke="#160404" stroke-width="5"/>
+  <rect x="294" y="116" width="6" height="22" fill="#160404"/>
+  <rect x="402" y="194" width="10" height="40" fill="#160404"/>
+  <rect x="402" y="200" width="10" height="3" fill="#ffffff"/>
+  <rect x="402" y="210" width="10" height="3" fill="#ffffff"/>
+  <rect x="402" y="220" width="10" height="3" fill="#ffffff"/>
+  <rect x="404" y="228" width="14" height="14" fill="#160404"/>
+  <!-- two axles, four tyres -->
+  <circle cx="200" cy="250" r="30" fill="#160404"/>
+  <circle cx="200" cy="250" r="12" fill="#ffffff"/>
+  <circle cx="350" cy="250" r="30" fill="#160404"/>
+  <circle cx="350" cy="250" r="12" fill="#ffffff"/>
+  <!-- lettering -->
+  <text x="256" y="439" text-anchor="middle" font-family="Arial Black, Arial, sans-serif" font-weight="900" font-size="200" fill="#DF3A42" stroke="#160404" stroke-width="8" paint-order="stroke" stroke-linejoin="round">MB</text>
+  <rect x="60" y="446" width="392" height="10" fill="#160404"/>
+  <text x="256" y="497" text-anchor="middle" font-family="Arial Black, Arial, sans-serif" font-weight="900" font-size="44" fill="#160404">MUTE / BLOCK</text>
+</svg>
+

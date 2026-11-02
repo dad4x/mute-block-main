@@ -201,9 +201,9 @@ test('the reason: a redirect is read from the reason text when the landing profi
     assert.equal(detail.reason, 'redirected to Will-Fridolf-5')
 })
 
-test('the reason: a profile that did not redirect, or has no record, is unavailable', () => {
+test('the reason: a profile that did not redirect, or has no record, is unavailable; a recorded reason is shown as recorded', () => {
     const {context} = loadBadLinkHarness()
-    assert.equal(context.getSpaceFeedBadLinkDetail(NICK_1145, {status: 'profile-unavailable', unavailableReason: 'Profile unavailable'}).reason, 'unavailable')
+    assert.equal(context.getSpaceFeedBadLinkDetail(NICK_1145, {status: 'profile-unavailable', unavailableReason: 'Profile unavailable'}).reason, 'Profile unavailable')
     assert.equal(context.getSpaceFeedBadLinkDetail(NICK_1145, null).reason, 'unavailable')
     // A landing profile that is the same as the requested one is not a redirect.
     assert.equal(context.getSpaceFeedBadLinkDetail(NICK_1145, {resolvedProfileHref: NICK_1145}).reason, 'unavailable')
@@ -318,8 +318,8 @@ test('the list code only shows links: it does not queue, change progress or writ
 })
 
 test('contract: the Bad Links button stays clickable, and its hover names the failed profiles with their reasons', () => {
-    assert.match(content, /else if\(hasBadLinks\) \{\n\s+setNukeButtonBadLinks\(singleButton\)\n(?:\s+\/\/[^\n]*\n)?\s+singleButton\.disabled = false\n\s+setMuteBlockHelp\(singleButton, `\$\{postLabel\}Bad Links/)
-    assert.match(content, /singleButton\.disabled = false\n\s+setMuteBlockHelp\(singleButton, `\$\{postLabel\}Bad Links: nothing here can be queued\. Failed: \$\{badLinkDetails\.map\(detail => `\$\{detail\.name\} \(\$\{detail\.reason\}\)`\)\.join\(', '\)\}\. Click for the links to block by hand\.`\)/)
+    assert.match(content, /else if\(hasBadLinks\) \{\n\s+const badLinksLabel = getSpaceFeedBadLinksButtonLabel\(badLinkDetails\)\n\s+setNukeButtonBadLinks\(singleButton, badLinksLabel\)\n(?:\s+\/\/[^\n]*\n)?\s+singleButton\.disabled = false\n\s+setMuteBlockHelp\(singleButton, `\$\{postLabel\}\$\{badLinksLabel\}: nothing here can be queued/)
+    assert.match(content, /Failed: \$\{badLinkDetails\.map\(detail => `\$\{detail\.name\} \(\$\{detail\.reason\}\)`\)\.join\(', '\)\}\./)
     assert.match(content, /syncSpaceFeedBadLinkList\(host, hasBadLinks && !postBusy \? badLinkDetails : \[\]\)/)
 })
 

@@ -480,7 +480,7 @@ test('a post with errors and nothing to queue shows a white Bad Links button, af
     const content = readRepoFile('shared/js/content.js')
     const css = readRepoFile('shared/css/content.css')
 
-    assert.match(content, /else if\(hasBadLinks\) \{\n\s+setNukeButtonBadLinks\(singleButton\)/)
+    assert.match(content, /else if\(hasBadLinks\) \{\n\s+const badLinksLabel = getSpaceFeedBadLinksButtonLabel\(badLinkDetails\)\n\s+setNukeButtonBadLinks\(singleButton, badLinksLabel\)/)
     assert.match(content, /const shouldShowControls = postNuked \|\| aggregateCount > 0 \|\| hasCandidates \|\| postBusy \|\| hasBadLinks/)
     assert.match(css, /\.mb-ext_nuke-profiles-btn--bad-links \{|--bad-links,\n/)
     assert.ok(content.indexOf('else if(postBusy) {') < content.indexOf('else if(hasBadLinks) {'))

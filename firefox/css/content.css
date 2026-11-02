@@ -653,6 +653,15 @@
     box-shadow: inset 0 0 0 1px #9ca3af;
 }
 
+/* 1 Nov (owner): two or more reasons on one post stack, one line per reason, in a taller pill. */
+.mb-ext_space-feed-post-single-nuke-btn.mb-ext_nuke-profiles-btn--bad-links.mb-ext_nuke-profiles-btn--stacked {
+    display: block;
+    text-align: center;
+    line-height: 1.25;
+    padding: 6px 12px;
+    white-space: normal;
+}
+
 /* Owner, 29 Oct: the list beside a Bad Links button, one line per failed profile. It sits under the button, inside the post's controls. */
 .mb-ext_space-feed-bad-links {
     position: absolute;
