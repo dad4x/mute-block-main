@@ -128,12 +128,15 @@ module.exports = {
     // dropdown's choice is kept for that search page only, in memory: it is not saved, and it resets on reload or a new search.
     // "Nuke 'Em" keeps the default count.
     PROFILE_SEARCH_COLLECT_LIMIT: 100,
-    PROFILE_SEARCH_COLLECT_CHOICES: [25, 50, 100, 250, 500, 1000],
+    PROFILE_SEARCH_COLLECT_CHOICES: [25, 50, 100, 250, 500, 1000, 2000],
 
     // Scrolling in the collect loops and the modal nuke (content.js). The wait after each scroll before the page is read again. Quora
     // slows down deeper into a feed, so a feed that stops growing at the bottom only counts as ended after COLLECT_END_CONFIRM_MS.
     COLLECT_SCROLL_PASS_WAIT_MS: 500,
     COLLECT_END_CONFIRM_MS: 3000,
+    // The adaptive pause between collect passes (1 Nov): its ceiling, and the silent passes in a row that a list needs at its bottom before it counts as ended.
+    COLLECT_ADAPTIVE_WAIT_MAX_MS: 3000,
+    COLLECT_ADAPTIVE_END_SILENT_PASSES: 3,
     MODAL_PROFILE_NUKE_SCROLL_WAIT_MS: 900,
     // Collect loops (content.js): a collect that stops moving for this long gives up. The space page checks this only away from the bottom
     // (at the bottom the feed ends after COLLECT_END_CONFIRM_MS instead); profile search checks it at any position. (Moved from content.js as

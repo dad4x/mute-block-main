@@ -58,8 +58,9 @@ test('the detail carries the recorded deactivated reason as recorded', () => {
     assert.equal(detail.reason, 'Profile deactivated')
 })
 
-test('a profile with no recorded reason reads unavailable', () => {
-    assert.equal(context.getSpaceFeedBadLinkDetail(ALICE, {status: 'error'}).reason, 'unavailable')
+test('a record with no unavailable reason reads its final error, then its status; only a missing record reads unavailable', () => {
+    assert.equal(context.getSpaceFeedBadLinkDetail(ALICE, {status: 'error', finalError: 'Quora error page'}).reason, 'Quora error page')
+    assert.equal(context.getSpaceFeedBadLinkDetail(ALICE, {status: 'error'}).reason, 'error')
     assert.equal(context.getSpaceFeedBadLinkDetail(ALICE, null).reason, 'unavailable')
 })
 

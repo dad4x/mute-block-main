@@ -108,9 +108,10 @@ body {
     width: 84px;
 }
 
+/* 1 Nov (audit): a drop-down is an action, so it is a pill. */
 .select {
     border: 1px solid var(--mb-grey-300);
-    border-radius: 6px;
+    border-radius: 999px;
     padding: 6px 8px;
 }
 
@@ -267,8 +268,9 @@ body {
     color: var(--mb-brand-red);
 }
 
+/* 1 Nov (audit): a category label is static info, so it is a rectangle. */
 .space-item-category {
-    border-radius: 999px;
+    border-radius: 4px;
     font-size: 11px;
     font-weight: 700;
     padding: 2px 8px;

@@ -150,6 +150,12 @@
     opacity: 1;
 }
 
+/* 1 Nov (audit): a status display (Nuking, Nuked, a notice or error) is not a button, so it is a rectangle, disabled or not. A real button
+   stays a pill. The state setters in content.js add this class. */
+.mb-ext_nuke-profiles-btn--status {
+    border-radius: 4px;
+    cursor: default;
+}
 .mb-ext_nuke-profiles-btn:hover {
     background-color: #000;
 }
@@ -219,6 +225,19 @@
     box-shadow: inset 0 0 0 1px #000;
 }
 
+/* 1 Nov (owner): a running collect is an active button, so its Stop collecting label is a black pill. */
+[class*="collect"].mb-ext_nuke-profiles-btn--working,
+[class*="collect"].mb-ext_nuke-profiles-btn--working:hover {
+    background-color: #111;
+    color: #fff;
+    box-shadow: none;
+}
+
+/* 1 Nov (owner): the running collect's Stop is an action, so it is a pill even though it reads as a status while it runs. */
+[class*="collect"].mb-ext_nuke-profiles-btn--working.mb-ext_nuke-profiles-btn--status {
+    border-radius: 999px;
+}
+
 .mb-ext_nuke-profiles-btn--done {
     background-color: #6b7280;
     color: #fff;
@@ -272,6 +291,22 @@
 .mb-ext_profile-search-collect-wrap {
     position: relative;
     display: inline-flex;
+}
+
+/* The popup's header (1 Nov): the right group (Open Profiles, Nuke 'Em, the collect copy) sits at the right edge with a constant gap. The copy
+   sizes to its content, so a longer running label moves the buttons to its left instead of overflowing the popup. */
+.mb-ext_modal-collect-wrap {
+    margin-left: 8px;
+}
+
+[role="dialog"] .mb-ext_open-profiles-btn {
+    margin-left: auto;
+}
+
+.mb-ext_modal-collect-btn {
+    max-width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
 }
 
 /* The caret is part of the Collect N More button. The count dropdown is a transparent select over it, so the caret opens the list. */
@@ -449,12 +484,17 @@
     vertical-align: middle;
 }
 
+/* 1 Nov (audit): a drop-down is an action, so it is a pill. It matches the Nuke 'Em buttons' size (14px text, 4px 10px padding, no
+   border), so the border is an inset shadow and does not add height. */
 .mb-ext_nuking-control-toggle {
-    font-size: 12px;
-    line-height: 1.2;
-    padding: 2px 8px;
-    border: 1px solid var(--mb-grey-300);
-    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    font-size: 14px;
+    line-height: 1.15;
+    padding: 4px 10px;
+    border: 0;
+    box-shadow: inset 0 0 0 1px var(--mb-grey-300);
+    border-radius: 999px;
     background: var(--mb-white);
     color: var(--mb-grey-700);
     cursor: pointer;

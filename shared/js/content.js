@@ -55,7 +55,7 @@ const {
 } = require('./storageKeys')
 const {namespaceArea, namespaceChanges} = require('./storageNamespace')
 const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS, SPACE_FEED_STATE_RETRY_MS, CONTENT_PROGRESS_BAR_POLL_MS, SPACE_FEED_STATE_POLL_MS, OWNED_NUKE_STATUS_TTL_MS, OWNED_NUKE_STATUS_WAIT_MS, SPACE_FEED_RENDER_MIN_GAP_MS, SPACE_FEED_PROFILE_LINK_CARD_CACHE_MS, SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS, SPACE_FEED_CONTENT_ROOT_MEMO_MS, SPACE_FEED_SCAN_REUSE_MS, SPACE_FEED_SCAN_BAND_DOWN_PX, SPACE_FEED_SCAN_BAND_UP_PX, SPACE_FEED_RENDER_MODEL_MEMO_MS} = require('./tunables')
-const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_SCROLL_PASS_WAIT_MS, COLLECT_END_CONFIRM_MS, MODAL_PROFILE_NUKE_SCROLL_WAIT_MS, COLLECT_STALLED_TIMEOUT_MS, COLLECT_STOP_LABEL_TICK_MS, CANDIDATE_BATCH_PROFILES_PER_BATCH} = require('./tunables')
+const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_SCROLL_PASS_WAIT_MS, COLLECT_END_CONFIRM_MS, MODAL_PROFILE_NUKE_SCROLL_WAIT_MS, COLLECT_STALLED_TIMEOUT_MS, COLLECT_STOP_LABEL_TICK_MS, CANDIDATE_BATCH_PROFILES_PER_BATCH, COLLECT_ADAPTIVE_WAIT_MAX_MS, COLLECT_ADAPTIVE_END_SILENT_PASSES} = require('./tunables')
 const {
     WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS,
     WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS,
@@ -94,8 +94,8 @@ const {
     COORDINATOR_ENQUEUE_CHUNK_SIZE
 } = require('./coordinatorEnqueueChunking')
 const {createEnqueueMarkStore} = require('./candidateMarks')
-const {formatCollectStopLabel, STOP_COLLECT_LABEL_TEXT} = require('./candidateCollect')
-const {collectPassMadeProgress, runCollectLoop} = require('./candidateCollect')
+const {formatCollectStopLabel, formatElapsed, STOP_COLLECT_LABEL_TEXT} = require('./candidateCollect')
+const {collectPassMadeProgress, runCollectLoop, createAdaptiveCollectWait} = require('./candidateCollect')
 const {runBatchNuke} = require('./candidateNuke')
 const {NOTHING_QUEUED_LABEL, NUKED_LABEL, formatToolbarNukingStatus, formatProfileRowState} = require('./candidateStatus')
 const {nukingControlView, nukingStatusShowsControl, spaceFeedNukingToolbar} = require('./nukingControl')
@@ -2929,7 +2929,7 @@ function setNukeButtonIdle(button, label = `Nuke 'Em`) {
         return
     }
     button.dataset.mbNukeState = 'idle'
-    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done', 'mb-ext_nuke-profiles-btn--bad-links')
+    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done', 'mb-ext_nuke-profiles-btn--bad-links', 'mb-ext_nuke-profiles-btn--status')
     button.innerText = label
 }
 
@@ -2944,7 +2944,8 @@ function setNukeButtonWorking(button, label = formatProfileRowState('nuking')) {
     }
     button.dataset.mbNukeState = 'working'
     button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--done', 'mb-ext_nuke-profiles-btn--bad-links')
-    button.classList.add('mb-ext_nuke-profiles-btn--working')
+    // Nuking is a status display, not a button (1 Nov): it is drawn as a rectangle, see --status in content.css.
+    button.classList.add('mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--status')
     button.innerText = label
 }
 
@@ -2960,7 +2961,8 @@ function setNukeButtonDone(button, label = NUKED_LABEL) {
     }
     button.dataset.mbNukeState = 'done'
     button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--bad-links')
-    button.classList.add('mb-ext_nuke-profiles-btn--done')
+    // Nuked is a status display, not a button (1 Nov): drawn as a rectangle, see --status in content.css.
+    button.classList.add('mb-ext_nuke-profiles-btn--done', 'mb-ext_nuke-profiles-btn--status')
     button.innerText = label
 }
 
@@ -2969,7 +2971,7 @@ function setNukeButtonBadLinks(button, label = 'Bad Links') {
     if(!button) return
     detachNukingControl(button)
     button.dataset.mbNukeState = 'bad-links'
-    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done')
+    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done', 'mb-ext_nuke-profiles-btn--status')
     button.classList.add('mb-ext_nuke-profiles-btn--bad-links')
     // Two or more reasons stack in a taller pill (1 Nov): one line per reason, see the --stacked rule in content.css.
     button.classList.toggle('mb-ext_nuke-profiles-btn--stacked', `${label || ''}`.includes('\n'))
@@ -3041,6 +3043,8 @@ function setNukeButtonNotice(button, label, restoreLabel = `Nuke 'Em`) {
     if(!button) return
 
     setNukeButtonIdle(button, label)
+    // A notice ("Nothing queued", an error) is a status display, not a button (1 Nov): drawn as a rectangle until it restores.
+    button.classList.add('mb-ext_nuke-profiles-btn--status')
     const noticeToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     button.dataset.mbNukeNoticeToken = noticeToken
     setTimeout(() => {
@@ -6887,7 +6891,7 @@ function injectSpaceSidebarOpenProfilesBtn() {
 
     if(viewLink) {
         let btn = document.createElement('button')
-        btn.innerText = 'View Contributors'
+        btn.innerText = 'View/Collect Contributors'
         btn.classList.add('mb-ext_open-profiles-btn', 'mb-ext_view-contributors-btn')
         setMuteBlockHelp(btn, 'Open the contributor list for this space')
         btn.addEventListener('click', () => viewLink.click())
@@ -7115,6 +7119,7 @@ async function collectMoreSpaceFeedPosts(button) {
         const atFeedBottom = () => window.innerHeight + (window.scrollY || 0) >= document.documentElement.scrollHeight - 4
         // Set when a pass waited for a hidden tab. The pass after that counts as progress, so the wait is not read as a stall.
         let resumedFromHiddenTab = false
+        const adaptiveWait = createAdaptiveCollectWait({floorMs: COLLECT_SCROLL_PASS_WAIT_MS, ceilingMs: COLLECT_ADAPTIVE_WAIT_MAX_MS})
         const outcome = await runCollectLoop({
             isStopRequested: () => spaceFeedCollectStopRequested,
             isDone: () => isSpaceFeedCollectDone(startCount, peakCount, limit),
@@ -7129,7 +7134,8 @@ async function collectMoreSpaceFeedPosts(button) {
                 window.scrollBy({top: Math.round(window.innerHeight * 0.8), behavior: 'auto'})
             },
             sleep,
-            waitMs: COLLECT_SCROLL_PASS_WAIT_MS,
+            waitMs: () => adaptiveWait.current(),
+            onPass: made => adaptiveWait.observe(made),
             readProgress: () => {
                 peakCount = Math.max(peakCount, readSpaceFeedCollectedCount())
                 // A pass counts once its read has run, so the label's count and passes always describe the same reads.
@@ -7142,7 +7148,7 @@ async function collectMoreSpaceFeedPosts(button) {
                 resumedFromHiddenTab = false
                 return resumed || collectPassMadeProgress(before, after)
             },
-            endCheck: stalledMs => atFeedBottom() && stalledMs >= COLLECT_END_CONFIRM_MS,
+            endCheck: stalledMs => atFeedBottom() && stalledMs >= COLLECT_END_CONFIRM_MS && adaptiveWait.silentPasses() >= COLLECT_ADAPTIVE_END_SILENT_PASSES,
             stallTimeoutApplies: () => !atFeedBottom(),
             stallTimeoutMs: COLLECT_STALLED_TIMEOUT_MS
         })
@@ -7220,21 +7226,30 @@ function ensureSpaceCollectWrapAboveFeed() {
 // column can be much taller than its boxes: Quora reserves height for a list that has not rendered, so the copy goes right after the last box,
 // not at the end of the column.
 function ensureSpaceCollectWrapInRightColumn() {
+    // On a target space the contributors box has the popup collect, so no posts copy goes under it (1 Nov).
+    if(isTargetSpacePage()) {
+        document.querySelector('.mb-ext_space-collect-column-host')?.remove()
+        return
+    }
     const column = getSpaceRightColumn()
     const existing = document.querySelector('.mb-ext_space-collect-column-host')
     if(!column) {
         existing?.remove()
         return
     }
-    const lastBox = getLastSpaceColumnBox(column)
-    if(existing && (lastBox ? lastBox.nextElementSibling === existing : column.lastElementChild === existing)) return
+    // 1 Nov (owner): the copy sits directly under the View Contributors button, in the same box, not at the foot of the column. The last box
+    // is the fallback when the button is not in this column.
+    const viewBtn = document.querySelector('.mb-ext_view-contributors-btn')
+    const underButton = viewBtn && column.contains(viewBtn) ? (viewBtn.closest('.q-box') || viewBtn.parentElement) : null
+    const anchor = underButton || getLastSpaceColumnBox(column)
+    if(existing && (anchor ? anchor.nextElementSibling === existing : column.lastElementChild === existing)) return
 
     const host = existing || document.createElement('div')
     if(!existing) {
         host.className = 'mb-ext_space-collect-column-host'
         host.appendChild(createSpaceCollectWrap('mb-ext_space-collect-column'))
     }
-    if(lastBox) lastBox.insertAdjacentElement('afterend', host)
+    if(anchor) anchor.insertAdjacentElement('afterend', host)
     else column.appendChild(host)
 }
 
@@ -7278,6 +7293,8 @@ function removeSpaceCollectButtons() {
 }
 
 function injectSpaceCollectButton() {
+    // A target space has the Posts-page Collect N More above MB Info, which scans posts. Its contributors collect is in the popup, opened from
+    // View/Collect Contributors (owner, 1 Nov: both, one scans posts, the other contributors).
     if(getPageType() !== 'space' || !isNukableSpacePage() || !document.querySelector('a.post_timestamp, a.answer_timestamp')) {
         removeSpaceCollectButtons()
         return false
@@ -8959,7 +8976,9 @@ function getSpaceFeedBadLinkDetail(href, record = null) {
     return {
         href: requestedHref,
         name,
-        reason: redirected ? `redirected to ${landedHref.split('/profile/')[1] || landedHref}` : (record?.unavailableReason || 'unavailable')
+        // 1 Nov: a record with no unavailable reason still says what it recorded: its final error, then its status. "unavailable" is the
+        // fallback only when there is no record at all.
+        reason: redirected ? `redirected to ${landedHref.split('/profile/')[1] || landedHref}` : (record?.unavailableReason || record?.finalError || record?.status || 'unavailable')
     }
 }
 
@@ -11880,7 +11899,8 @@ function syncSpaceFeedPostButtons(renderModel) {
             setNukeButtonBadLinks(singleButton, badLinksLabel)
             // Owner, 29 Oct: enabled, because a disabled button gets no click. The click only opens or closes the list (see the click handler).
             singleButton.disabled = false
-            setMuteBlockHelp(singleButton, `${postLabel}${badLinksLabel}: nothing here can be queued. Failed: ${badLinkDetails.map(detail => `${detail.name} (${detail.reason})`).join(', ')}. Click for the links to block by hand.`)
+            // One line per failed profile (1 Nov), so the hover reads as a list.
+            setMuteBlockHelp(singleButton, `${postLabel}${badLinksLabel}: nothing here can be queued.\nFailed:\n${badLinkDetails.map(detail => `- ${detail.name} (${detail.reason})`).join('\n')}\nClick for the links to block by hand.`)
         }
         else {
             setNukeButtonIdle(singleButton, 'Mute Block')
@@ -13009,7 +13029,8 @@ function injectModalOpenProfilesBtn() {
             nukeBtn.disabled = true
         }
         else if(nukeBtn.dataset.mbNukeState !== 'working') {
-            setNukeButtonIdle(nukeBtn)
+            // 1 Nov (owner): the popup's Nuke 'Em shows the number of candidates, unique profiles, as the toolbar does.
+            setNukeButtonIdle(nukeBtn, `Nuke 'Em ${getModalProfileLinks(nukeItems).length}`)
             nukeBtn.disabled = false
         }
         setMuteBlockHelp(nukeBtn, buildNukeTargetsHelpText('Queue listed profiles from this modal for mute and block', getModalProfileLinks(nukeItems)))
@@ -13018,6 +13039,122 @@ function injectModalOpenProfilesBtn() {
         setNukeButtonDone(nukeBtn)
         nukeBtn.disabled = true
     }
+
+    // 1 Nov (owner): Collect N More sits next to the popup's Nuke 'Em, with the same count drop-down as the space page. It scrolls the list.
+    let collectWrap = modal.querySelector('.mb-ext_modal-collect-wrap')
+    if(!collectWrap && nukeBtn) {
+        collectWrap = createModalCollectWrap()
+        // 1 Nov (owner): the copy stays in the header row, after Nuke 'Em. The row's right group (Open Profiles, Nuke 'Em, the copy) is
+        // anchored to the right edge with a constant gap, so the others follow the copy as its label changes width.
+        nukeBtn.insertAdjacentElement('afterend', collectWrap)
+    }
+    let collectBtn = collectWrap?.querySelector('.mb-ext_modal-collect-btn') || null
+    if(collectBtn) {
+        // A click while a collect runs asks it to stop; it is not disabled, so the stop can be pressed (1 Nov).
+        collectBtn = ensureCurrentInstanceClickHandler(collectBtn, 'modal-collect-more', event => {
+            if(modalCollecting) {
+                modalCollectStopRequested = true
+                return
+            }
+            void collectMoreProfileModal(event.currentTarget)
+        })
+        if(!modalCollecting && collectBtn.dataset.mbNukeState !== 'working') setNukeButtonIdle(collectBtn, `Collect ${spaceFeedCollectLimit} More`)
+        collectBtn.disabled = false
+        setMuteBlockHelp(collectBtn, modalCollecting
+            ? 'Stop collecting contributors from this list. The contributors already collected stay in the list.'
+            : `Scroll this list for ${spaceFeedCollectLimit} more contributors`)
+    }
+    const collectSelect = collectWrap?.querySelector('.mb-ext_profile-search-collect-limit') || null
+    if(collectSelect) {
+        ensureCurrentInstanceClickHandler(collectSelect, 'modal-collect-limit', event => {
+            // The count is the one saved for the space, so the space page's button and this one show the same number (1 Nov).
+            setSpaceFeedCollectLimit(Number.parseInt(event.currentTarget.value, 10))
+            const popupBtn = event.currentTarget.closest('.mb-ext_modal-collect-wrap')?.querySelector('.mb-ext_modal-collect-btn')
+            if(popupBtn && !modalCollecting) setNukeButtonIdle(popupBtn, `Collect ${spaceFeedCollectLimit} More`)
+        }, 'change')
+        if(collectSelect.value !== String(spaceFeedCollectLimit)) collectSelect.value = String(spaceFeedCollectLimit)
+        collectSelect.disabled = false
+    }
+}
+
+// The popup's collect copy: the button and the count drop-down, built the same way as the space page's copy (createSpaceCollectWrap).
+function createModalCollectWrap() {
+    const wrap = document.createElement('span')
+    wrap.className = 'mb-ext_profile-search-collect-wrap mb-ext_modal-collect-wrap'
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'mb-ext_nuke-profiles-btn mb-ext_profile-search-collect-btn mb-ext_modal-collect-btn'
+    wrap.appendChild(button)
+    wrap.appendChild(createProfileSearchCollectLimitSelect())
+    return wrap
+}
+
+// The popup's Collect N More (1 Nov): scroll the contributor list until N more contributors have loaded, the list ends, or Stop is pressed.
+// The button reads the same Stop collecting label as the space page: collected / target, scrolls, and elapsed time.
+let modalCollecting = false
+let modalCollectStopRequested = false
+async function collectMoreProfileModal(button) {
+    const modal = getProfilePeopleModal()
+    if(!modal || modalCollecting) return false
+
+    // The same shared loop the space page runs (runCollectLoop in candidateCollect.js), with the same Stop collecting label. The list scrolls
+    // one step per pass; a pass that moves nothing means the list has ended.
+    const limit = spaceFeedCollectLimit
+    const start = getProfileModalItems(modal).length
+    const progress = {startedAt: Date.now(), passes: 0, collected: 0}
+    const scroller = () => getProfileModalScrollContainer(modal)
+    const atModalBottom = () => { const el = scroller(); return !el || el.scrollTop + el.clientHeight >= el.scrollHeight - 4 }
+    const label = () => formatCollectStopLabel({collected: progress.collected, target: spaceFeedCollectLimit, passes: progress.passes, elapsedMs: Date.now() - progress.startedAt})
+    modalCollecting = true
+    modalCollectStopRequested = false
+    setNukeButtonWorking(button, label())
+    let endReached = false
+    let stalled = false
+    try {
+        const adaptiveWait = createAdaptiveCollectWait({floorMs: MODAL_PROFILE_NUKE_SCROLL_WAIT_MS, ceilingMs: COLLECT_ADAPTIVE_WAIT_MAX_MS})
+        const outcome = await runCollectLoop({
+            isStopRequested: () => modalCollectStopRequested,
+            isDone: () => progress.collected >= spaceFeedCollectLimit,
+            snapshot: () => ({count: getProfileModalItems(modal).length, scrollY: scroller()?.scrollTop || 0, scrollHeight: scroller()?.scrollHeight || 0}),
+            pass: () => {
+                const el = scroller()
+                if(!el) return 'done'
+                const step = Math.max(240, Math.round(el.clientHeight * 0.85))
+                el.scrollTop = Math.min(Math.max(0, el.scrollHeight - el.clientHeight), el.scrollTop + step)
+                el.dispatchEvent(new Event('scroll', {bubbles: true}))
+                el.dispatchEvent(new WheelEvent('wheel', {bubbles: true, deltaY: step}))
+            },
+            sleep,
+            waitMs: () => adaptiveWait.current(),
+            onPass: made => adaptiveWait.observe(made),
+            readProgress: () => {
+                progress.passes += 1
+                progress.collected = Math.min(spaceFeedCollectLimit, Math.max(0, getProfileModalItems(modal).length - start))
+                if(button.isConnected) setNukeButtonWorking(button, label())
+            },
+            madeProgress: collectPassMadeProgress,
+            // Quora can be slow to load the next batch, so a silent pass is not the end. The list has ended only when it is at its bottom and has
+            // stayed still for COLLECT_END_CONFIRM_MS (the space page's rule). Away from the bottom, a long silence is a stall, not the end.
+            endCheck: stalledMs => atModalBottom() && stalledMs >= COLLECT_END_CONFIRM_MS && adaptiveWait.silentPasses() >= COLLECT_ADAPTIVE_END_SILENT_PASSES,
+            stallTimeoutApplies: () => !atModalBottom(),
+            stallTimeoutMs: COLLECT_STALLED_TIMEOUT_MS
+        })
+        endReached = outcome === 'end'
+        stalled = outcome === 'stalled'
+    }
+    finally {
+        modalCollecting = false
+    }
+
+    const collected = progress.collected
+    const elapsed = formatElapsed(Date.now() - progress.startedAt)
+    const stopped = modalCollectStopRequested
+    modalCollectStopRequested = false
+    if(stopped) setNukeButtonNotice(button, 'Stopped', `Collect ${spaceFeedCollectLimit} More`)
+    else if(collected < 1) setNukeButtonNotice(button, 'No new contributors', `Collect ${spaceFeedCollectLimit} More`)
+    else if(stalled) setNukeButtonNotice(button, `Collected ${collected} · stalled · ${elapsed}`, `Collect ${spaceFeedCollectLimit} More`)
+    else setNukeButtonNotice(button, endReached ? `Collected ${collected} · end of list · ${elapsed}` : `Collected ${collected} · ${elapsed}`, `Collect ${spaceFeedCollectLimit} More`)
+    return true
 }
 
 function getModalOpenProfilesLabel(modal = getProfilePeopleModal()) {

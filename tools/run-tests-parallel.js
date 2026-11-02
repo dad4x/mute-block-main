@@ -22,6 +22,7 @@ const lanes = [
       ['node', 'test/spaceFeedBannedLabel.test.js'],
       ['node', 'test/spaceFeedAnswerChaseUrl.test.js'],
       ['node', 'test/spaceFeedChaseQueuedBusy.test.js'],
+      ['node', 'test/candidateAdaptiveWait.test.js'],
       ['node', 'test/queueDisplayWaitingForTab.test.js'],
       ['node', 'test/spaceFeedResolverChaseQueued.test.js'],
       ['node', 'test/collectHiddenTabWait.test.js'],

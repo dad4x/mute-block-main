@@ -318,8 +318,8 @@ test('the list code only shows links: it does not queue, change progress or writ
 })
 
 test('contract: the Bad Links button stays clickable, and its hover names the failed profiles with their reasons', () => {
-    assert.match(content, /else if\(hasBadLinks\) \{\n\s+const badLinksLabel = getSpaceFeedBadLinksButtonLabel\(badLinkDetails\)\n\s+setNukeButtonBadLinks\(singleButton, badLinksLabel\)\n(?:\s+\/\/[^\n]*\n)?\s+singleButton\.disabled = false\n\s+setMuteBlockHelp\(singleButton, `\$\{postLabel\}\$\{badLinksLabel\}: nothing here can be queued/)
-    assert.match(content, /Failed: \$\{badLinkDetails\.map\(detail => `\$\{detail\.name\} \(\$\{detail\.reason\}\)`\)\.join\(', '\)\}\./)
+    assert.match(content, /else if\(hasBadLinks\) \{\n\s+const badLinksLabel = getSpaceFeedBadLinksButtonLabel\(badLinkDetails\)\n\s+setNukeButtonBadLinks\(singleButton, badLinksLabel\)\n(?:\s+\/\/[^\n]*\n)?\s+singleButton\.disabled = false\n(?:\s+\/\/[^\n]*\n)?\s+setMuteBlockHelp\(singleButton, `\$\{postLabel\}\$\{badLinksLabel\}: nothing here can be queued/)
+    assert.match(content, /Failed:\\n\$\{badLinkDetails\.map\(detail => `- \$\{detail\.name\} \(\$\{detail\.reason\}\)`\)\.join\('\\n'\)\}\\nClick/)
     assert.match(content, /syncSpaceFeedBadLinkList\(host, hasBadLinks && !postBusy \? badLinkDetails : \[\]\)/)
 })
 

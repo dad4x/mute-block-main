@@ -59,6 +59,7 @@ async function runCollectLoop({
     waitMs,
     readProgress = () => {},
     madeProgress,
+    onPass = () => {},
     endCheck = () => false,
     stallTimeoutMs,
     stallTimeoutApplies = () => true,
@@ -70,10 +71,13 @@ async function runCollectLoop({
         const before = snapshot()
         const passOutcome = await pass(before)
         if(passOutcome === 'end' || passOutcome === 'done') return passOutcome
-        await sleep(waitMs)
+        // waitMs is a number, or a function that gives the pause before this pass (the adaptive wait below).
+        await sleep(typeof waitMs === 'function' ? waitMs() : waitMs)
         readProgress()
         const after = snapshot()
-        if(madeProgress(before, after)) {
+        const made = madeProgress(before, after)
+        onPass(made)
+        if(made) {
             stalledStartedAt = 0
             continue
         }
@@ -88,4 +92,26 @@ async function runCollectLoop({
     return null
 }
 
-module.exports = {formatElapsed, formatCollectStopLabel, STOP_COLLECT_LABEL_TEXT, collectPassMadeProgress, runCollectLoop}
+// The adaptive pause between passes (1 Nov). Quora slows as a list grows, so a fixed pause is too short late in a run and too long early. A pass
+// that grew the list shortens the next pause (to three quarters of it, not below the floor). A silent pass doubles it, up to the ceiling. The
+// count of silent passes in a row is kept, so a list that is still loading is not read as its end.
+function createAdaptiveCollectWait({floorMs = 500, ceilingMs = 10000} = {}) {
+    let waitMs = floorMs
+    let silent = 0
+    return {
+        current: () => waitMs,
+        silentPasses: () => silent,
+        observe(madeProgress) {
+            if(madeProgress) {
+                silent = 0
+                waitMs = Math.max(floorMs, Math.round(waitMs * 0.75))
+            }
+            else {
+                silent += 1
+                waitMs = Math.min(ceilingMs, waitMs * 2)
+            }
+        }
+    }
+}
+
+module.exports = {formatElapsed, formatCollectStopLabel, STOP_COLLECT_LABEL_TEXT, collectPassMadeProgress, runCollectLoop, createAdaptiveCollectWait}

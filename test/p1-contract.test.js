@@ -5072,7 +5072,7 @@ test('Stop collecting on space and search pages is fixed at the bottom, its left
     // The right column: the copy goes after the last box. The Stop button is not in the column (owner, 26 Oct), so no column re-render can remove it mid-run.
     assert.match(columnBody, /host\.appendChild\(createSpaceCollectWrap\('mb-ext_space-collect-column'\)\)/)
     assert.doesNotMatch(columnBody, /createSpaceCollectStopButton/)
-    assert.match(columnBody, /lastBox\.insertAdjacentElement\('afterend', host\)/)
+    assert.match(columnBody, /anchor\.insertAdjacentElement\('afterend', host\)/)
     // Fixed at the bottom, with its left edge on the Nuke 'Em left edge (coordinator correction): one shared rule for both Stop buttons, at the toolbar's stacking.
     const stopRule = css.match(/\.mb-ext_space-collect-stop-btn,\s*\n\.mb-ext_profile-search-stop-btn \{[^}]*\}/)
     assert.ok(stopRule, 'the Stop collecting buttons share a fixed CSS rule')
@@ -5109,7 +5109,7 @@ test('the Stop collecting label on both pages comes from the shared candidateCol
     const searchSync = extractFunction(source, 'function syncProfileSearchStopButton()')
 
     // Both pages call the same helper, and neither builds the label text by hand.
-    assert.match(source, /const \{formatCollectStopLabel, STOP_COLLECT_LABEL_TEXT\} = require\('\.\/candidateCollect'\)/)
+    assert.match(source, /const \{formatCollectStopLabel, formatElapsed, STOP_COLLECT_LABEL_TEXT\} = require\('\.\/candidateCollect'\)/)
     assert.match(extractFunction(source, 'function createSpaceCollectStopButton()'), /button\.textContent = STOP_COLLECT_LABEL_TEXT/)
     assert.match(extractFunction(source, 'function createProfileSearchStopButton()'), /button\.textContent = STOP_COLLECT_LABEL_TEXT/)
     assert.match(extractFunction(source, 'function refreshSpaceFeedStopLabel()'), /formatCollectStopLabel\(\{/)

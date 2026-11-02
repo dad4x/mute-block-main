@@ -89,7 +89,7 @@ test('the space loop exit lines are unchanged: the run-state condition, the end-
     // A pass that waited for a hidden tab counts as progress; every other pass is judged by collectPassMadeProgress (31 Oct).
     assert.match(body, /return resumed \|\| collectPassMadeProgress\(before, after\)/)
     assert.match(candidateSource, /return after\.count > before\.count \|\| after\.scrollY > before\.scrollY \|\| after\.scrollHeight > before\.scrollHeight/)
-    assert.match(body, /endCheck: stalledMs => atFeedBottom\(\) && stalledMs >= COLLECT_END_CONFIRM_MS,/)
+    assert.match(body, /endCheck: stalledMs => atFeedBottom\(\) && stalledMs >= COLLECT_END_CONFIRM_MS && adaptiveWait\.silentPasses\(\) >= COLLECT_ADAPTIVE_END_SILENT_PASSES,/)
     assert.match(body, /stallTimeoutApplies: \(\) => !atFeedBottom\(\),/)
     assert.match(body, /stallTimeoutMs: COLLECT_STALLED_TIMEOUT_MS/)
     assert.match(loop, /while\(!isStopRequested\(\) && !isDone\(\)\) \{/)

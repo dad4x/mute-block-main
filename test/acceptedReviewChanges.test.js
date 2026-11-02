@@ -374,7 +374,7 @@ register('the settings writer keeps a value only when its type matches its defau
 register('the Collect N More count is kept for one search page, takes only the dropdown choices, and resets with the search', () => {
     const tunables = require('../shared/js/tunables.js')
     assert.equal(tunables.PROFILE_SEARCH_COLLECT_LIMIT, 100)
-    assert.deepEqual([...tunables.PROFILE_SEARCH_COLLECT_CHOICES], [25, 50, 100, 250, 500, 1000])
+    assert.deepEqual([...tunables.PROFILE_SEARCH_COLLECT_CHOICES], [25, 50, 100, 250, 500, 1000, 2000])
 
     const location = {origin: 'https://www.quora.com', pathname: '/search', search: '?q=first'}
     let syncs = 0
