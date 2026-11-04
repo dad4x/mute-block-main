@@ -27,6 +27,8 @@ function registerServiceWorkerListeners(deps = {}) {
     } = deps
     // A tab event can change how queued rows classify (a tab opened, closed or updated), so it bumps the executor input generation.
     const bumpExecutorInput = typeof deps.bumpExecutorInputGeneration === 'function' ? deps.bumpExecutorInputGeneration : () => {}
+    // A main-frame 404 on a queued tab is recorded at once (see recordQueuedTabNotFound in sw.js); nothing else on that page can answer.
+    const recordQueuedTabNotFound = typeof deps.recordQueuedTabNotFound === 'function' ? deps.recordQueuedTabNotFound : () => null
 
     // Times a request a content script awaits before it acts (profile pages wait on these), so a slow
     // worker shows up in the flight recorder as a content-request event. Diagnostic only.
@@ -1222,6 +1224,11 @@ function registerServiceWorkerListeners(deps = {}) {
             redirectPath
         })
     }, quoraNavigationFilter)
+    // Only a 404 on the main frame of a queued tab. The not-found page has no content script to answer, so waiting on it only stalls the row.
+    browser.webRequest.onCompleted.addListener(details => {
+        if(details.statusCode !== 404 || details.tabId < 0) return
+        Promise.resolve(recordQueuedTabNotFound(details.tabId, details.url)).catch(() => null)
+    }, {urls: ['https://*.quora.com/*'], types: ['main_frame']})
     browser.webRequest.onErrorOccurred.addListener(details => {
         let path = ''
         try { path = new URL(details.url).pathname } catch {}

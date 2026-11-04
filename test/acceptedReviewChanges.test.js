@@ -467,7 +467,7 @@ register('the space Collect N More stops after N more are collected, and its cho
     assert.match(collectBody, /isDone: \(\) => isSpaceFeedCollectDone\(startCount, peakCount, limit\)/)
     assert.match(collectBody, /window\.scrollBy\(/)
     // The copy above the feed's buttons sits on its own row, first in the feed toolbar.
-    assert.match(readRepoFile('shared/css/content.css'), /\.mb-ext_space-feed-toolbar > \.mb-ext_space-collect-feed-host \{\n    order: -1;/)
+    assert.match(readRepoFile('shared/css/content.css'), /\.mb-ext_space-feed-toolbar > \.mb-ext_space-collect-feed-host \{\n    order: 1;/)
 })
 
 // Review-3 R3-4. The dashboard's run-status poll is one timer. The dev-mode visibility path starts it while dev mode is on and

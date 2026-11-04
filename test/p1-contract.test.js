@@ -1575,7 +1575,7 @@ test('dashboard layout keeps current work first and panel blocks wheel-scroll th
     assert.doesNotMatch(html, /Cancel Queue/)
     assert.doesNotMatch(html, /Enable Retry Soft-Fails|id="retryFailedButton"|id="requeueFailedButton"|id="cancelCurrentWorkButton"/)
     assert.match(html, /id="clearCurrentWorkButton" type="button"[^>]*>Clear</)
-    assert.match(html, /id="workerBarCancel"/)
+    assert.match(dashboard, /makeButton\('Cancel'/) // the #progress page's Cancel is built by the shared bar in coordinator.js (3 Nov)
     assert.doesNotMatch(html, /Requeue Failed|Cancel Current Work|Idle Retry/)
     assert.match(dashboard, /startCoordinatorQueue\(\)/)
     assert.match(dashboard, /allowBeforeQuora: true/)
@@ -5171,8 +5171,9 @@ test('every hover the extension adds starts with "Mute Block extension: " (28 Oc
 test('every extension button has hover help that starts with "Mute Block extension: "', () => {
     const pageHtml = readRepoFile('shared/coordinator.html') + readRepoFile('shared/preferences.html')
     const buttonTags = pageHtml.match(/<button\b[^>]*>/g) || []
-    // 40 after the Cancel Queue, Requeue, soft-fail toggle and Authority reads panel removals (was 45).
-    assert.ok(buttonTags.length >= 40, `expected at least 40 buttons in the pages, found ${buttonTags.length}`)
+    // 40 after the Cancel Queue, Requeue, soft-fail toggle and Authority reads panel removals (was 45). Five more (the #progress page's
+    // Pause, Cancel, Dashboard, History, Preferences) moved into the shared bar in coordinator.js (3 Nov), so 35 are in the HTML.
+    assert.ok(buttonTags.length >= 35, `expected at least 35 buttons in the pages, found ${buttonTags.length}`)
     for(const tag of buttonTags) assert.match(tag, /\stitle="Mute Block extension: [^"]+"/, tag)
 
     assert.match(readRepoFile('shared/js/muteBlockHelp.js'), /const MUTE_BLOCK_HELP_PREFIX = 'Mute Block extension: '/)
@@ -5324,7 +5325,7 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
     assert.match(html, /id="pauseCurrentWorkState"/)
     assert.doesNotMatch(html, /id="cancelCurrentWorkButton"/)
     assert.doesNotMatch(html, /Cancel Queue/)
-    assert.match(html, /id="workerBarCancel"/)
+    assert.match(dashboard, /makeButton\('Cancel'/) // the #progress page's Cancel is built by the shared bar in coordinator.js (3 Nov)
     assert.match(dashboard, /resume-paused-coordinator-nukes/)
     assert.match(dashboard, /cancel-coordinator-current-work/)
     assert.match(dashboard, /cancel-coordinator-current-work-item/)

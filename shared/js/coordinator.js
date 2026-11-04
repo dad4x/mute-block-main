@@ -387,15 +387,36 @@ async function clearHistory() {
 // rendered stacked on top of the plain dashboard.
 // The dashboard's footer bar is built by the same function as the page's progress bar (queueProgressBar.js), so the two look the same.
 let dashboardBottomBarProgress = null
+let dashboardBottomBarPauseResume = null
+
+// The Pause/Resume label and its disabled state, shared by the footer and the #progress page so both read the same (3 Nov).
+function syncPauseResumeButton(button) {
+    if(!button) return
+    const pausePending = currentWorkPausePending === 'pause'
+    const resumePending = currentWorkPausePending === 'resume'
+    button.textContent = pausePending
+        ? 'Pausing...'
+        : resumePending
+            ? 'Resuming...'
+            : state.paused ? 'Resume' : 'Pause'
+    button.disabled = pausePending || resumePending
+}
 
 function installDashboardBottomBar() {
     if(dashboardBottomBarProgress) return
+    dashboardBottomBarPauseResume = document.createElement('button')
+    dashboardBottomBarPauseResume.type = 'button'
+    dashboardBottomBarPauseResume.className = 'worker-bar-button'
+    dashboardBottomBarPauseResume.id = 'dashboardBottomBarPauseResume'
+    setMuteBlockHelp(dashboardBottomBarPauseResume, 'Mute Block extension: Pause the queue, or resume it')
+    dashboardBottomBarPauseResume.addEventListener('click', () => { void toggleCurrentWorkPause() })
     dashboardBottomBarProgress = createQueueProgressBar({
         barId: 'dashboardBottomBar',
         iconSrc: 'icons/32.png',
         interactive: true,
         logoTitle: 'Open the dashboard',
-        onLogoClick: () => { void openDashboardFromBottomBar() }
+        onLogoClick: () => { void openDashboardFromBottomBar() },
+        controls: [dashboardBottomBarPauseResume]
     })
     // The bar sets its own display style, which would override the hidden attribute, so it is shown and hidden through that style.
     dashboardBottomBarProgress.bar.style.display = 'none'
@@ -455,23 +476,9 @@ async function initHistoryPage() {
 async function initWorkerBarPage() {
     await registerQueuedWorkerActionSurfacePage()
     const manifest = browser.runtime.getManifest()
+    installWorkerBarPage(document.getElementById('workerBarView'))
     const versionEl = document.getElementById('workerBarVersion')
     if(versionEl) versionEl.textContent = `v${manifest.version}`
-    document.getElementById('workerBarPauseResume')?.addEventListener('click', () => {
-        void toggleCurrentWorkPause()
-    })
-    document.getElementById('workerBarCancel')?.addEventListener('click', () => {
-        void cancelCurrentWork()
-    })
-    document.getElementById('workerBarDashboard')?.addEventListener('click', () => {
-        void openCoordinatorViewFromHere('open-coordinator')
-    })
-    document.getElementById('workerBarHistory')?.addEventListener('click', () => {
-        void openCoordinatorViewFromHere('open-coordinator-history')
-    })
-    document.getElementById('workerBarPreferences')?.addEventListener('click', () => {
-        void openPreferences()
-    })
     installCompactStorageRefreshPolling()
     installDashboardRuntimeRefreshListener()
     render()
@@ -1503,32 +1510,50 @@ function renderDurationHistograms() {
 // the full control-panel dashboard (see historical/nits3.md item 5 discussion): just a
 // window-width progress fill of handled-vs-total Current Work items, a
 // count, and the handful of actions relevant to a background worker window.
-function renderWorkerBar() {
-    const total = getQueueTotalCount()
-    const terminal = getQueueTerminalCount()
-    const fill = document.getElementById('workerBarFill')
-    const count = document.getElementById('workerBarCount')
-    const pauseResumeButton = document.getElementById('workerBarPauseResume')
-    const cancelButton = document.getElementById('workerBarCancel')
+// The #progress page's bar is the footer's bar (the same builder, the same numbers) placed inline in the window, with its actions after the count (3 Nov).
+let workerBarProgress = null
+const workerBarButtons = {pauseResume: null, cancel: null}
 
-    if(fill) fill.style.width = `${total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0}%`
-    if(count) count.textContent = `${terminal} / ${total}`
-
-    if(pauseResumeButton) {
-        const pausePending = currentWorkPausePending === 'pause'
-        const resumePending = currentWorkPausePending === 'resume'
-        pauseResumeButton.textContent = pausePending
-            ? 'Pausing...'
-            : resumePending
-                ? 'Resuming...'
-                : state.paused ? 'Resume' : 'Pause'
-        pauseResumeButton.disabled = pausePending || resumePending
+function installWorkerBarPage(view) {
+    if(workerBarProgress || !view) return
+    const makeButton = (label, title, onClick, extraClass = '') => {
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.className = `worker-bar-button${extraClass}`
+        button.textContent = label
+        setMuteBlockHelp(button, title)
+        button.addEventListener('click', onClick)
+        return button
     }
+    workerBarButtons.pauseResume = makeButton('Pause', 'Mute Block extension: Pause the queue, or resume it', () => { void toggleCurrentWorkPause() })
+    workerBarButtons.cancel = makeButton('Cancel', 'Mute Block extension: Cancel the Current Work in the queue', () => { void cancelCurrentWork() }, ' worker-bar-button--danger')
+    const dashboardButton = makeButton('Dashboard', 'Mute Block extension: Open the dashboard', () => { void openCoordinatorViewFromHere('open-coordinator') })
+    const historyButton = makeButton('History', 'Mute Block extension: Open the history page', () => { void openCoordinatorViewFromHere('open-coordinator-history') })
+    const preferencesButton = makeButton('Preferences', 'Mute Block extension: Open the preferences page', () => { void openPreferences() })
+    const version = document.createElement('div')
+    version.id = 'workerBarVersion'
+    version.style.opacity = '0.6'
+    version.style.whiteSpace = 'nowrap'
+    version.textContent = 'v0.0.0'
+    workerBarProgress = createQueueProgressBar({
+        barId: 'workerBar',
+        iconSrc: 'icons/116.png',
+        interactive: true,
+        inline: true,
+        controls: [workerBarButtons.pauseResume, workerBarButtons.cancel, dashboardButton, historyButton, preferencesButton, version]
+    })
+    view.replaceChildren(workerBarProgress.bar)
+}
 
-    if(cancelButton) {
-        const pendingCount = getPendingCurrentWorkItems().length
-        cancelButton.disabled = pendingCount <= 0
-    }
+function renderWorkerBar(queueItems = []) {
+    const total = getQueueTotalCount(queueItems)
+    const terminal = getQueueTerminalCount(queueItems)
+    workerBarProgress?.setProgress(
+        total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0,
+        `${terminal} / ${total}`
+    )
+    syncPauseResumeButton(workerBarButtons.pauseResume)
+    if(workerBarButtons.cancel) workerBarButtons.cancel.disabled = getPendingCurrentWorkItems().length <= 0
 }
 
 // The plain dashboard's own footer strip -- same handled-vs-total fill as
@@ -1544,6 +1569,7 @@ function renderDashboardBottomBar(queueItems = []) {
         total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0,
         `${terminal} / ${total}`
     )
+    syncPauseResumeButton(dashboardBottomBarPauseResume)
 }
 
 // The bottom-bar logo is a "jump to the real dashboard" shortcut, meant to
@@ -1600,7 +1626,7 @@ function formatBlockOutcomeDuration(count = 0, totalDurationMs = 0, maxDurationM
 
 function render() {
     if(isQueuedWorkerActionSurfacePage()) {
-        renderWorkerBar()
+        renderWorkerBar(getDisplayQueueItems())
         return
     }
 

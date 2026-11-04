@@ -16882,7 +16882,9 @@ async function recordProfileUnavailableFromPage(itemKey = '', href = '', expecte
         openedViablePage: false,
         finalError: reason,
         unavailableReason: reason,
-        event: 'Profile page not found (redirected to a non-profile URL)'
+        event: reason === QUEUED_TAB_NOTFOUND_OUTCOME
+            ? 'Quora returned 404 for this profile; skipped, not blocked'
+            : 'Profile page not found (redirected to a non-profile URL)'
     }, {senderTabId: tabId}).catch(() => null)
     return {changed: result?.changed === true, reason: 'profile-unavailable-page-not-found'}
 }
@@ -32786,6 +32788,54 @@ async function resolveQueuedProfileTarget(request = {}, sender = {}) {
     return result || {resolved: false, reason: 'resolver-remap-save-failed'}
 }
 
+// A queued tab whose main frame came back HTTP 404 (Quora's not-found page). That page never gets a content script, so nothing in
+// the tab can answer a close check or report "did not land". The row is recorded now as notfound-404 rather than waiting for a
+// reply that cannot come. Only 404 takes this path; other error pages keep their existing handling.
+const QUEUED_TAB_NOTFOUND_OUTCOME = 'notfound-404'
+const QUEUED_TAB_NOTFOUND_ERROR = 'Quora returned 404 Not Found for this queued page'
+async function recordQueuedTabNotFound(tabId, url = '') {
+    const normalizedTabId = normalizeTabId(tabId)
+    const metadata = normalizedTabId ? getQueuedTabMetadata(normalizedTabId) : null
+    if(!metadata) return {recorded: false, reason: 'no-queued-tab-metadata'}
+
+    const coordinatorKey = `${metadata.coordinatorKey || ''}`
+    let recorded = false
+    if(coordinatorKey.startsWith('resolve-profile:') || metadata.resolveProfileFromPage === true) {
+        const result = await markQueuedProfileResolutionUnresolved({
+            requestedUrl: metadata.requestedUrl || url,
+            coordinatorKey,
+            attemptId: metadata.attemptId,
+            attemptNumber: metadata.attemptNumber,
+            outcome: QUEUED_TAB_NOTFOUND_OUTCOME,
+            error: QUEUED_TAB_NOTFOUND_ERROR
+        }, {tab: {id: normalizedTabId}}).catch(() => null)
+        recorded = result?.recorded === true
+    }
+    else {
+        const active = resolveActiveQueuedActionForBlockedPageEvent(normalizedTabId)
+        if(active) {
+            const result = await recordProfileUnavailableFromPage(active.itemKey, active.href, active.item, null, {
+                tab: {id: normalizedTabId},
+                response: {unavailableReason: QUEUED_TAB_NOTFOUND_OUTCOME}
+            })
+            recorded = result?.changed === true
+        }
+    }
+    recordFlightRecorderEvent({
+        kind: 'queued-tab-notfound-404',
+        source: 'recordQueuedTabNotFound',
+        tabId: normalizedTabId,
+        targetUrl: url,
+        rowKey: coordinatorKey,
+        attemptId: metadata.attemptId || '',
+        attemptNumber: metadata.attemptNumber || 0,
+        accepted: recorded,
+        reason: QUEUED_TAB_NOTFOUND_OUTCOME
+    })
+    if(recorded) await closeQueuedTabAfterTerminal(normalizedTabId, QUEUED_TAB_NOTFOUND_OUTCOME, {awaitFill: true}).catch(() => null)
+    return {recorded, reason: recorded ? QUEUED_TAB_NOTFOUND_OUTCOME : 'not-recorded'}
+}
+
 async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) {
     const tabId = sender.tab?.id || null
     const metadata = tabId ? getQueuedTabMetadata(tabId) : null
@@ -35760,6 +35810,7 @@ async function getContentPageCoordinatorState(request = {}, sender = {}) {
 registerServiceWorkerListeners({
     browser,
     bumpExecutorInputGeneration,
+    recordQueuedTabNotFound,
     constants: {
         defaults,
         COORDINATOR_RESUME_ALARM_NAME,

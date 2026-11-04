@@ -8,26 +8,7 @@
 <link rel="stylesheet" href="css/coordinator.css">
 </head>
 <body>
-    <div class="worker-bar" id="workerBarView" hidden>
-        <div class="worker-bar-brand">
-            <img class="worker-bar-logo" src="icons/116.png" alt="" aria-hidden="true">
-            <div>
-                <div class="worker-bar-title">Progress</div>
-                <div class="version" id="workerBarVersion">v0.0.0</div>
-            </div>
-        </div>
-        <div class="worker-bar-progress" id="workerBarProgress">
-            <div class="worker-bar-fill" id="workerBarFill"></div>
-        </div>
-        <div class="worker-bar-count" id="workerBarCount" title="Mute Block extension: Completed rows out of all rows in Current Work">0 / 0</div>
-        <div class="worker-bar-actions">
-            <button class="worker-bar-button" id="workerBarPauseResume" type="button" title="Mute Block extension: Pause the queue, or resume it">Pause</button>
-            <button class="worker-bar-button worker-bar-button--danger" id="workerBarCancel" type="button" title="Mute Block extension: Cancel the Current Work in the queue">Cancel</button>
-            <button class="worker-bar-button" id="workerBarDashboard" type="button" title="Mute Block extension: Open the dashboard">Dashboard</button>
-            <button class="worker-bar-button" id="workerBarHistory" type="button" title="Mute Block extension: Open the history page">History</button>
-            <button class="worker-bar-button" id="workerBarPreferences" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
-        </div>
-    </div>
+    <div id="workerBarView" hidden></div>
 
     <main class="coordinator" id="historyView" hidden>
         <header class="coordinator-header">

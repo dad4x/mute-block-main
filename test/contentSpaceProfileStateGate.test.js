@@ -705,7 +705,7 @@ test('banned and deactivated profiles are counted apart from other unavailable p
     const jobState = readRepoFile('shared/js/jobState.js')
     const reason = extractFunction(content, 'function getProfileUnavailableReason()')
     assert.match(reason, /return matches\(\/\\bdeactivated\\b\/\) \? 'Profile deactivated' : 'Profile banned'/)
-    assert.match(jobState, /outcome: reason === 'Profile banned' \? 'banned' : reason === 'Profile deactivated' \? 'deactivated' : 'profile-unavailable'/)
+    assert.match(jobState, /outcome: reason === 'Profile banned' \? 'banned' : reason === 'Profile deactivated' \? 'deactivated' : reasonOutcome \|\| 'profile-unavailable'/)
     const coordinator = readRepoFile('shared/js/coordinator.js')
     assert.match(coordinator, /\n\s+banned: 'Banned: /)
     assert.match(coordinator, /\n\s+deactivated: 'Deactivated: /)

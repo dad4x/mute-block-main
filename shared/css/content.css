@@ -343,9 +343,9 @@
 }
 
 /* Space pages: the Collect N More button on its own row, above the MB Info and Nuke 'Em buttons of the feed toolbar. */
+/* 1 Nov (owner): the Posts-page copy shares the toolbar row with MB Info and Nuke 'Em, after them, so MB Info leads the row. */
 .mb-ext_space-feed-toolbar > .mb-ext_space-collect-feed-host {
-    order: -1;
-    flex-basis: 100%;
+    order: 1;
     display: flex;
     justify-content: flex-end;
 }
@@ -422,6 +422,12 @@
     margin-left: 0;
     font-size: 12px;
     padding: 3px 8px;
+}
+
+/* A search row that is nuking shows only its drop-down (3 Nov): the working chip beside it is hidden. The rule needs the drop-down
+   right after the chip, so a queueing row, which has no drop-down, keeps its chip. */
+.mb-ext_profile-search-action-host .mb-ext_profile-search-row-btn.mb-ext_nuke-profiles-btn--working:has(+ .mb-ext_nuking-control) {
+    display: none;
 }
 
 .mb-ext_post-nuke-btn {

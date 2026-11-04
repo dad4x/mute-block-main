@@ -175,11 +175,13 @@ function mapProgressToJobState(record = null) {
         }
     }
     if(status === 'profile-unavailable') {
-        // Banned and deactivated accounts are counted apart from other unavailable profiles (31 Oct).
+        // Banned and deactivated accounts are counted apart from other unavailable profiles (31 Oct). A reason that is a plain slug
+        // (notfound-404) is the outcome as written, so the skipped breakdown names it rather than collapsing it.
         const reason = `${record.unavailableReason || ''}`
+        const reasonOutcome = /^[a-z0-9]+(-[a-z0-9]+)*$/.test(reason) ? reason : ''
         return {
             status: 'skipped',
-            outcome: reason === 'Profile banned' ? 'banned' : reason === 'Profile deactivated' ? 'deactivated' : 'profile-unavailable',
+            outcome: reason === 'Profile banned' ? 'banned' : reason === 'Profile deactivated' ? 'deactivated' : reasonOutcome || 'profile-unavailable',
             error: record.finalError || record.unavailableReason || '',
             terminal: true
         }

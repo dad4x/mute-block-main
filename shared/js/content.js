@@ -6882,7 +6882,15 @@ function injectSpacePostNukeBtn() {
 }
 
 function injectSpaceSidebarOpenProfilesBtn() {
-    if(document.querySelector('.mb-ext_view-contributors-btn, .mb-ext_open-profiles-btn')) return
+    // The label follows the space (2 Nov, owner): View/Collect Contributors on a target space, View Contributors on an asset or neutral space.
+    // The label is kept current on every call, since the category can be learned after the button is placed.
+    const viewLabel = isTargetSpacePage() ? 'View/Collect Contributors' : 'View Contributors'
+    const existingViewBtn = document.querySelector('.mb-ext_view-contributors-btn')
+    if(existingViewBtn) {
+        if(existingViewBtn.innerText !== viewLabel) existingViewBtn.innerText = viewLabel
+        return
+    }
+    if(document.querySelector('.mb-ext_open-profiles-btn')) return
 
     const XPATH = "//div[contains(@class, 'q-click-wrapper') and contains(string(), 'View all')]"
     let query = document.evaluate(XPATH, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null)
@@ -6891,7 +6899,7 @@ function injectSpaceSidebarOpenProfilesBtn() {
 
     if(viewLink) {
         let btn = document.createElement('button')
-        btn.innerText = 'View/Collect Contributors'
+        btn.innerText = viewLabel
         btn.classList.add('mb-ext_open-profiles-btn', 'mb-ext_view-contributors-btn')
         setMuteBlockHelp(btn, 'Open the contributor list for this space')
         btn.addEventListener('click', () => viewLink.click())
@@ -7226,11 +7234,9 @@ function ensureSpaceCollectWrapAboveFeed() {
 // column can be much taller than its boxes: Quora reserves height for a list that has not rendered, so the copy goes right after the last box,
 // not at the end of the column.
 function ensureSpaceCollectWrapInRightColumn() {
-    // On a target space the contributors box has the popup collect, so no posts copy goes under it (1 Nov).
-    if(isTargetSpacePage()) {
-        document.querySelector('.mb-ext_space-collect-column-host')?.remove()
-        return
-    }
+    // No Collect N More on the contributors box (2 Nov, owner): contributors are collected from the popup only. Any copy left there is removed.
+    document.querySelector('.mb-ext_space-collect-column-host')?.remove()
+    return
     const column = getSpaceRightColumn()
     const existing = document.querySelector('.mb-ext_space-collect-column-host')
     if(!column) {

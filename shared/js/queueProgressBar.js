@@ -1,13 +1,16 @@
-// The progress bar at the bottom of a queue page. The space page and the dashboard both build it here, so they look and lay out the same.
-// Values are set by the caller through setProgress; this file only builds and styles the bar.
+// The progress bar at the bottom of a queue page. The space page, the dashboard footer and the #progress page all build it here, so they
+// look and lay out the same. Values are set by the caller through setProgress; this file only builds and styles the bar. `controls` are
+// buttons placed after the count (the footer's Pause/Resume; the #progress page's full action row). `inline` lays the bar out in the page
+// flow instead of pinning it to the bottom of the window (the #progress page is the whole window).
 const { BRAND_RED } = require('./colorTokens')
 const { setMuteBlockHelp } = require('./muteBlockHelp')
 
 function createQueueProgressBar(options = {}) {
     const barId = options.barId || 'mb-queue-progress'
     const darkMode = options.darkMode === true
-    // Interactive bars (the dashboard) take clicks on their logo button. The page bar never takes clicks, so it never blocks the page beneath it.
+    // Interactive bars (the dashboard and #progress) take clicks on their logo and controls. The page bar never takes clicks, so it never blocks the page beneath it.
     const interactive = options.interactive === true
+    const inline = options.inline === true
     const barBackground = darkMode ? 'rgba(32, 32, 35, 0.92)' : 'rgba(255, 255, 255, 0.92)'
     const textColor = darkMode ? '#e8e8ea' : '#1c1c1e'
     const trackBackground = darkMode ? 'rgba(255, 255, 255, 0.18)' : 'rgba(0, 0, 0, 0.12)'
@@ -15,17 +18,19 @@ function createQueueProgressBar(options = {}) {
 
     const bar = document.createElement('div')
     bar.id = barId
-    bar.style.position = 'fixed'
-    bar.style.left = '0'
-    bar.style.right = '0'
-    bar.style.bottom = '0'
-    bar.style.zIndex = '999999'
+    if(!inline) {
+        bar.style.position = 'fixed'
+        bar.style.left = '0'
+        bar.style.right = '0'
+        bar.style.bottom = '0'
+        bar.style.zIndex = '999999'
+        bar.style.borderTop = `1px solid ${borderColor}`
+    }
     bar.style.display = 'flex'
     bar.style.alignItems = 'center'
     bar.style.gap = '10px'
     bar.style.padding = '5px 12px'
     bar.style.background = barBackground
-    bar.style.borderTop = `1px solid ${borderColor}`
     bar.style.color = textColor
     bar.style.fontSize = '12px'
     bar.style.fontFamily = 'system-ui, -apple-system, sans-serif'
@@ -86,7 +91,8 @@ function createQueueProgressBar(options = {}) {
     count.className = `${barId}-count`
     count.style.whiteSpace = 'nowrap'
 
-    bar.append(brand, track, count)
+    const controls = Array.isArray(options.controls) ? options.controls.filter(Boolean) : []
+    bar.append(brand, track, count, ...controls)
 
     return {
         bar,
