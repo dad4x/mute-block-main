@@ -16149,6 +16149,7 @@ const queuedTabReclaimResume = createQueuedTabReclaimResume({
         isProfileResolutionItem,
         normalizeQuoraProfileUrl,
         getOwnedOrExpectedLiveTabsForProfileHref,
+        isOwnedWorkerSurfaceTab,
         getPersistedQueuedTabId,
         normalizeTabId,
         incrementQueueWakeupMetric,
@@ -16246,15 +16247,16 @@ async function getWorkerSurfaceLiveTabForQueuedCoordinatorItem(item = null, item
 
     const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey) || normalizeQuoraProfileUrl(record?.profileHref || '')
     const expectedUrl = getCoordinatorItemExpectedExecutorUrl(item, record, itemKey)
+    // Only a tab the queue opened is a candidate. A tab the user has on the same address is not adopted or closed (owner, 7 Nov).
     let candidates = getLiveTabsForProfileHref(liveProfileTabsByHref, href)
-        .filter(tab => normalizeTabId(tab?.id) && !hasOwnedQueuedTabState(tab.id))
+        .filter(tab => normalizeTabId(tab?.id) && isOwnedWorkerSurfaceTab(tab))
     if((isProfileResolutionItem(item) || !href) && expectedUrl) {
         let requestedUrlTabs = []
         try {
             requestedUrlTabs = (await browser.tabs.query({url: 'https://*.quora.com/*'}))
                 .filter(tab =>
                     normalizeTabId(tab?.id) &&
-                    !hasOwnedQueuedTabState(tab.id) &&
+                    isOwnedWorkerSurfaceTab(tab) &&
                     queuedTabMatchesExpectedOpenUrl(tab, expectedUrl)
                 )
         }
@@ -35723,6 +35725,38 @@ async function rebuildContentPageStateProjectionFromCurrentState(reason = 'missi
     }
 }
 
+// The live rows of the posts a content page names (6 Nov). The source index is keyed by the page's full URL, query included, and an
+// unresolved post has no profile to key on, so neither reaches such a row once the page's URL has changed. The rows are read from the
+// resident queue. Returns false when that queue is not hydrated, and then the reply says nothing about these posts.
+function addLiveCoordinatorRowsForPostKeys(scopedQueue, rawPostKeys = []) {
+    const postKeys = new Set((Array.isArray(rawPostKeys) ? rawPostKeys : []).map(key => `${key || ''}`.trim()).filter(Boolean))
+    if(!postKeys.size) return false
+
+    const authority = getHydratedCoordinatorAuthorityState('contentPageState.postKeys')
+    if(!authority) return false
+
+    for(const [itemKey, item] of Object.entries(authority.queue)) {
+        if(!shouldIncludeCoordinatorItemInContentQueueIndex(item)) continue
+        if(!Array.isArray(item.evidence) || !item.evidence.some(evidence => postKeys.has(`${evidence?.postKey || ''}`.trim()))) continue
+        scopedQueue[itemKey] = summarizeCoordinatorContentQueueItem(itemKey, item)
+    }
+    return true
+}
+
+// The chase URLs (a resolver candidate's question log) that a completed row settles (6 Nov). A normal space nuke merges such a candidate into
+// its completed row instead of queueing it, unless the row is a retryable failure (see shouldResetCoordinatorItemForIncoming). The reply
+// names these chase URLs, echoed as the page sent them, so the page stops offering the candidates the worker will not queue.
+async function findSettledCoordinatorChaseUrls(rawChaseUrls) {
+    const chaseUrls = new Set((Array.isArray(rawChaseUrls) ? rawChaseUrls : []).map(url => `${url || ''}`.trim()).filter(Boolean))
+    const settled = []
+    for(const chaseUrl of chaseUrls) {
+        const key = makeProfileResolutionQueueKey(normalizeCoordinatorRequestedUrl(chaseUrl))
+        const row = await coordinatorQueueReader.completedRow(key).catch(() => null)
+        if(row && !isRetryableCoordinatorFailure(row)) settled.push(chaseUrl)
+    }
+    return settled
+}
+
 async function getContentPageCoordinatorState(request = {}, sender = {}) {
     // The asking tab is pushed to when progress changes from now on (swProfileNukeProgressPush.js, decision 15's pattern).
     profileNukeProgressPush.subscribe(sender?.tab?.id)
@@ -35809,6 +35843,10 @@ async function getContentPageCoordinatorState(request = {}, sender = {}) {
         shouldLoadFullQueueForTruncatedContentPageState({truncated: true}, request, profileHrefs, scopedQueue)) {
         Object.assign(scopedQueue, await loadScopedCoordinatorQueueFallbackForContentPage(request, profileHrefSet))
     }
+    // postKeysCovered: the reply holds every live row of the posts the page named, so the page may drop a pending row of those posts it
+    // does not get back (6 Nov).
+    const postKeysCovered = addLiveCoordinatorRowsForPostKeys(scopedQueue, request.postKeys)
+    const settledChaseUrls = await findSettledCoordinatorChaseUrls(request.chaseUrls)
     for(const [profileHref, record] of Object.entries({
         ...progressView.records,
         ...shardProgress
@@ -35884,6 +35922,8 @@ async function getContentPageCoordinatorState(request = {}, sender = {}) {
         pageType: request.pageType || '',
         profileHrefCount: profileHrefs.length,
         coordinatorQueue: scopedQueue,
+        postKeysCovered,
+        settledChaseUrls,
         profileNukeProgress: scopedProgress,
         queueRows: Object.keys(scopedQueue).length,
         progressRows: Object.keys(scopedProgress).length,

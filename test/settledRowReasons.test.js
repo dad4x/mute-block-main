@@ -40,5 +40,6 @@ test('the archived-row settlement passes the row outcome and error as the reason
 
 test('the bad-link reason reads unavailableReason before finalError, so the row reason shows', () => {
     const content = readRepoFile('shared/js/content.js')
-    assert.match(content, /reason: redirected \? `redirected to \$\{landedHref\.split\('\/profile\/'\)\[1\] \|\| landedHref\}` : \(record\?\.unavailableReason \|\| record\?\.finalError \|\| record\?\.status \|\| 'unavailable'\)/)
+    // A banned, deactivated, inactivated or deleted signal comes first (6 Nov); otherwise the fallback order below holds.
+    assert.match(content, /: signal \? signal\[1\] : \(redirected \? `redirected to \$\{landedHref\.split\('\/profile\/'\)\[1\] \|\| landedHref\}` : \(record\?\.unavailableReason \|\| record\?\.finalError \|\| record\?\.status \|\| 'unavailable'\)\)/)
 })

@@ -21,7 +21,12 @@ function formatElapsed(ms) {
     return `${Math.floor(totalSeconds / 60)}:${String(totalSeconds % 60).padStart(2, '0')}`
 }
 
-function formatCollectStopLabel({collected = 0, target = 0, passes = 0, elapsedMs = 0} = {}) {
+// In time mode (timeLimitMs > 0) the clock counts down to the end, so the label shows the time left, not the time run (7 Nov).
+function formatCollectStopLabel({collected = 0, target = 0, passes = 0, elapsedMs = 0, timeLimitMs = 0} = {}) {
+    if (timeLimitMs > 0) {
+        const leftSeconds = Math.ceil(Math.max(0, timeLimitMs - elapsedMs) / 1000)
+        return `${countOf(collected)} ${STOP_COLLECT_LABEL_TEXT} · ${countOf(passes)} · ${formatMinutesSeconds(leftSeconds)} left`
+    }
     return `${countOf(collected)} / ${countOf(target)} ${STOP_COLLECT_LABEL_TEXT} · ${countOf(passes)} · ${formatElapsed(elapsedMs)}`
 }
 
@@ -124,4 +129,48 @@ function formatCollectEndNotice({stopped = false, collected = 0, endReached = fa
     return endReached ? `Collected ${collected} · ${endLabel}${timed}` : `Collected ${collected}${timed}`
 }
 
-module.exports = {formatElapsed, formatCollectStopLabel, formatCollectEndNotice, STOP_COLLECT_LABEL_TEXT, collectPassMadeProgress, runCollectLoop, createAdaptiveCollectWait}
+// A Collect dropdown value is a count ("25") or a time ("time:300" = 5 minutes) (7 Nov). parseCollectChoice reads either, and returns
+// {limit} or {seconds}, or null for anything the dropdown does not offer.
+const COLLECT_TIME_PREFIX = 'time:'
+
+function collectTimeValue(seconds) {
+    return `${COLLECT_TIME_PREFIX}${seconds}`
+}
+
+function parseCollectChoice(value, countChoices = [], timeChoices = []) {
+    const text = `${value ?? ''}`
+    if (text.startsWith(COLLECT_TIME_PREFIX)) {
+        const seconds = Number.parseInt(text.slice(COLLECT_TIME_PREFIX.length), 10)
+        return timeChoices.includes(seconds) ? {seconds} : null
+    }
+    const limit = Number.parseInt(text, 10)
+    return countChoices.includes(limit) ? {limit} : null
+}
+
+// mm:ss, with the minutes padded (5 seconds is 00:05, 5 minutes is 05:00).
+function formatMinutesSeconds(seconds = 0) {
+    const total = Math.max(0, Number.parseInt(seconds, 10) || 0)
+    return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`
+}
+
+// The button's words for a choice: "Collect 25 More", or "Collect for 05:00".
+function collectChoiceLabel(choice = {}) {
+    if (choice.seconds) return `Collect for ${formatMinutesSeconds(choice.seconds)}`
+    return `Collect ${choice.limit} More`
+}
+
+// The Collecting label while a collect runs (6 Nov). In time mode it says the time left, as "Collecting for mm:ss"; a count shows staged of target.
+function formatCollectingLabel({staged = 0, target = 0, timeSeconds = 0, startedAt = 0, now = Date.now()} = {}) {
+    if (timeSeconds > 0) {
+        const elapsed = Math.max(0, Math.floor((now - (Number(startedAt) || now)) / 1000))
+        return `Collecting for ${formatMinutesSeconds(Math.max(0, timeSeconds - elapsed))}`
+    }
+    return `Collecting ${staged} / ${target}`
+}
+
+// A time choice is done once its seconds have run from the press. The clock is the one the Stop button already shows.
+function isCollectTimeUp(startedAt = 0, seconds = 0, now = Date.now()) {
+    return seconds > 0 && now - (Number(startedAt) || 0) >= seconds * 1000
+}
+
+module.exports = {formatElapsed, formatCollectStopLabel, formatCollectEndNotice, STOP_COLLECT_LABEL_TEXT, collectPassMadeProgress, runCollectLoop, createAdaptiveCollectWait, collectTimeValue, parseCollectChoice, formatMinutesSeconds, collectChoiceLabel, isCollectTimeUp, formatCollectingLabel, COLLECT_TIME_PREFIX}

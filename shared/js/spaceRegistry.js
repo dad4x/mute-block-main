@@ -1,6 +1,6 @@
 const {SPACE_SORT_KEY} = require('./storageKeys')
 const {SPACE_REGISTRY_KEY} = require('./storageKeys')
-const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES} = require('./tunables')
+const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_TIME_SECONDS} = require('./tunables')
 const SPACE_SORT_NAME = 'name'
 const SPACE_SORT_CATEGORY = 'category'
 const SPACE_CATEGORY_ASSET = 'asset'
@@ -20,6 +20,11 @@ function normalizeSpaceCategory(category) {
 // The space's Collect N More count, kept on its registry record. Only a count the dropdown offers is kept; anything else is the default.
 function normalizeSpaceCollectCount(count) {
     return PROFILE_SEARCH_COLLECT_CHOICES.includes(count) ? count : PROFILE_SEARCH_COLLECT_LIMIT
+}
+
+// The space's Collect for-a-time choice, in seconds (7 Nov). 0 means the count is in use. Only a time the dropdown offers is kept.
+function normalizeSpaceCollectSeconds(seconds) {
+    return COLLECT_TIME_SECONDS.includes(seconds) ? seconds : 0
 }
 
 function getSpaceCategoryShortLabel(category) {
@@ -115,6 +120,8 @@ function buildSpaceRecord(space, category, existingRecord = null) {
         name: normalizeLabel(space?.name || existingRecord?.name || extractSpaceSlug(url) || url),
         category: nextCategory,
         collectCount: normalizeSpaceCollectCount(existingRecord?.collectCount),
+        // A space's first record starts on the default time (7 Nov); a record that exists keeps the choice it has.
+        collectSeconds: existingRecord ? normalizeSpaceCollectSeconds(existingRecord.collectSeconds) : PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS,
         updatedAt: Date.now()
     }
 }
@@ -126,6 +133,18 @@ function withSpaceRecordCollectCount(record, count) {
     return {
         ...record,
         collectCount: normalizeSpaceCollectCount(count),
+        collectSeconds: 0,
+        updatedAt: Date.now()
+    }
+}
+
+// The record with a time choice (7 Nov). The count it keeps stays as it was; the time takes over until a count is chosen again.
+function withSpaceRecordCollectSeconds(record, seconds) {
+    if(!record || typeof record !== 'object') return null
+
+    return {
+        ...record,
+        collectSeconds: normalizeSpaceCollectSeconds(seconds),
         updatedAt: Date.now()
     }
 }
@@ -145,6 +164,9 @@ function applySpaceRecordChange(existingRecord, key, change, at) {
     }
     else if(change.collectCount !== undefined) {
         next = withSpaceRecordCollectCount(existingRecord, change.collectCount)
+    }
+    else if(change.collectSeconds !== undefined) {
+        next = withSpaceRecordCollectSeconds(existingRecord, change.collectSeconds)
     }
     if(!next) return null
     return actedAt ? {...next, updatedAt: actedAt} : next
@@ -173,6 +195,8 @@ function normalizeLabel(value) {
 }
 
 module.exports = {
+    normalizeSpaceCollectSeconds,
+    withSpaceRecordCollectSeconds,
     SPACE_CATEGORY_ASSET,
     SPACE_CATEGORY_NEUTRAL,
     SPACE_CATEGORY_ORDER,

@@ -365,15 +365,20 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         browser.alarms.onAlarm.addListener(alarm => runAfterCoordinatorAuthorityReady(() => handleAlarm(alarm)))
     }
-    function handleTabRemoved(tabId) {
+    // DIAGNOSTIC (7 Nov): remove with the removeInfo fields below. Chrome says which window the tab was in and whether that window was closing.
+    function handleTabRemoved(tabId, removeInfo = {}) {
         noteTabRemoved(tabId)
         recordFlightRecorderEvent({
             kind: 'tab-removed',
             source: 'tabs.onRemoved',
             tabId,
+            windowId: Number.parseInt(removeInfo?.windowId, 10) || null,
+            isWindowClosing: removeInfo?.isWindowClosing === true,
+            workerCloseRequested: diagnosticWorkerCloseRequests.get(tabId) || null,
             accepted: true,
             changed: false
         })
+        diagnosticWorkerCloseRequests.delete(tabId)
         notifyQueuedWorkerActionSurfaceSlotMaybeFreed()
 
         if(normalizeTabId(tabId) === normalizeTabId(getQueuedActionSurfaceAnchorTabId())) {
@@ -523,9 +528,25 @@ function registerServiceWorkerListeners(deps = {}) {
             }
         })
     }
-    browser.tabs.onRemoved.addListener(tabId => {
+    // DIAGNOSTIC (7 Nov): remove with the wrapper below, and the removeInfo fields in handleTabRemoved.
+    // Every tabs.remove the worker makes (59 call sites) passes through here, so a close is recorded with the first worker frame that asked for it.
+    const diagnosticWorkerCloseRequests = new Map()
+    const diagnosticOriginalTabsRemove = browser.tabs.remove.bind(browser.tabs)
+    // Guarded: if the browser will not take the replacement, the close still works and only this record is lost.
+    try {
+        browser.tabs.remove = (tabId, ...rest) => {
+            const frame = `${new Error().stack || ''}`.split('\n').find(line => /sw\.js|swBootstrap|swProfile|swQueued|sw[A-Z]/.test(line) && !/diagnostic/i.test(line) && !/Object\.remove/.test(line)) || ''
+            diagnosticWorkerCloseRequests.set(tabId, `${frame.trim().slice(0, 90)}`)
+            recordFlightRecorderEvent({ kind: 'tab-close-requested', source: 'worker', tabId, reason: frame.trim().slice(0, 90), accepted: true, changed: false })
+            return diagnosticOriginalTabsRemove(tabId, ...rest)
+        }
+    }
+    catch {
+        // The diagnostic is off; the original remove stays in place.
+    }
+    browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
         bumpExecutorInput()
-        return runAfterCoordinatorAuthorityReady(() => handleTabRemoved(tabId))
+        return runAfterCoordinatorAuthorityReady(() => handleTabRemoved(tabId, removeInfo))
     })
     function handleTabUpdated(tabId, changeInfo, tab) {
         const observedUrl = `${changeInfo.url || tab?.url || ''}`.trim()

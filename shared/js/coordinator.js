@@ -195,7 +195,12 @@ function historyStatusLabel(row = {}) {
 
 // A row with an error reads in red: a failed row, or any row that carries an error text.
 // A block attempt that stopped because the profile is already followed is an error to look at, not a success (Oct 31).
+// A banned or deactivated profile is a success on History (owner, 7 Nov): the account is gone, and the row did its job. Its status
+// stays Skipped everywhere else.
+const HISTORY_SUCCESS_OUTCOMES = new Set(['banned', 'deactivated'])
+
 function historyRowHasError(row = {}) {
+    if (HISTORY_SUCCESS_OUTCOMES.has(`${row.outcome || ''}`)) return false
     return `${row.status || ''}` === 'failed' ||
         `${row.outcome || ''}` === 'block-attempt-on-following' ||
         `${row.error || row.finalError || ''}`.trim() !== ''
@@ -488,7 +493,6 @@ function syncPauseResumeButton(button) {
 function installQueueBottomBar() {
     if(queueBottomBar) return
     queueBottomBar = createQueueBottomBar({
-        onLogoClick: () => { void openDashboardFromBottomBar() },
         onPauseClick: () => { void toggleCurrentWorkPause() }
     })
 }
@@ -1671,16 +1675,6 @@ function renderDashboardBottomBar(queueItems = []) {
         hasWork: total > 0 && terminal < total,
         paused: state.paused
     })
-}
-
-// The bottom-bar logo is a "jump to the real dashboard" shortcut, meant to
-// work the same way wherever this bar ends up rendering -- a deliberate
-// no-op when the page showing it is already the plain dashboard (currently
-// the only place it renders, but the guard is what the button is supposed
-// to mean regardless of where it's embedded).
-async function openDashboardFromBottomBar() {
-    if(!isQueuedWorkerActionSurfacePage() && !isCoordinatorHistoryPage()) return
-    await openCoordinatorViewFromHere('open-coordinator')
 }
 
 function getBlockOutcomeCounts() {

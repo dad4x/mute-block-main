@@ -380,9 +380,12 @@ register('the Collect N More count is kept for one search page, takes only the d
     let syncs = 0
     const context = vm.createContext({
         PROFILE_SEARCH_COLLECT_LIMIT: tunables.PROFILE_SEARCH_COLLECT_LIMIT,
+        PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS: tunables.PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS,
         PROFILE_SEARCH_COLLECT_CHOICES: tunables.PROFILE_SEARCH_COLLECT_CHOICES,
         location,
         URLSearchParams,
+        parseCollectChoice: require('../shared/js/candidateCollect').parseCollectChoice,
+        COLLECT_TIME_SECONDS: [5, 10, 30, 60, 120, 300],
         profileSearchCollectionKey: '',
         profileSearchStagedHrefs: [],
         profileSearchStagedHrefSet: new Set(),
@@ -392,6 +395,7 @@ register('the Collect N More count is kept for one search page, takes only the d
     })
     vm.runInContext([
         'let profileSearchCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT',
+        'let profileSearchCollectSeconds = 0',
         extractFunction(contentSource, 'function getProfileSearchCollectLimit()'),
         extractFunction(contentSource, 'function setProfileSearchCollectLimit(value)'),
         extractFunction(contentSource, 'function getProfileSearchCollectionKey()'),
@@ -407,6 +411,10 @@ register('the Collect N More count is kept for one search page, takes only the d
     assert.equal(syncs, 1)
     run('setProfileSearchCollectLimit(7)')
     assert.equal(run('getProfileSearchCollectLimit()'), 250, 'a value the dropdown does not offer is ignored')
+    run('setProfileSearchCollectLimit("time:300")')
+    assert.equal(run('profileSearchCollectSeconds'), 300, 'a time option arrives as its raw dropdown value')
+    run('setProfileSearchCollectLimit("250")')
+    assert.equal(run('profileSearchCollectSeconds'), 0, 'a count after a time clears the time')
     run('ensureProfileSearchCollectionStateForCurrentSearch()')
     assert.equal(run('getProfileSearchCollectLimit()'), 250, 'the same search keeps its count')
     location.search = '?q=second'
@@ -426,17 +434,22 @@ register('the space Collect N More stops after N more are collected, and its cho
     let syncs = 0
     const context = vm.createContext({
         PROFILE_SEARCH_COLLECT_LIMIT: tunables.PROFILE_SEARCH_COLLECT_LIMIT,
+        PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS: tunables.PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS,
         PROFILE_SEARCH_COLLECT_CHOICES: tunables.PROFILE_SEARCH_COLLECT_CHOICES,
         location,
         syncSpaceFeedCollectButton: () => { syncs += 1 },
         // A space with no registry record: the count starts at the default and is not written anywhere.
         normalizeSpaceCollectCount: require('../shared/js/spaceRegistry.js').normalizeSpaceCollectCount,
+        normalizeSpaceCollectSeconds: require('../shared/js/spaceRegistry.js').normalizeSpaceCollectSeconds,
+        parseCollectChoice: require('../shared/js/candidateCollect').parseCollectChoice,
+        COLLECT_TIME_SECONDS: [5, 10, 30, 60, 120, 300],
         getStoredSpaceRecord: () => null,
         resolveCurrentSpaceDescriptor: () => null,
         persistSpaceFeedCollectCount: () => {}
     })
     vm.runInContext([
         'let spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT',
+        'let spaceFeedCollectSeconds = 0',
         "let spaceFeedCollectKey = ''",
         extractFunction(contentSource, 'function getSpaceFeedCollectKey()'),
         extractFunction(contentSource, 'function ensureSpaceFeedCollectStateForCurrentSpace()'),

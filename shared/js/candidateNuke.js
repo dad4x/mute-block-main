@@ -71,12 +71,13 @@ async function runBatchNuke({
     try {
         beforePress()
         await pressButton()
-        setWorking(formatQueueingLabel())
+        // The whole batch is still to queue when the press lands, so the count starts at the batch size (6 Nov).
+        setWorking(formatQueueingLabel(work.length))
         afterWorking()
 
         const result = await sendBatch(work, (queuedSoFar, mergedSoFar, totalItems) => {
             const remaining = Math.max(0, totalItems - Math.min(totalItems, queuedSoFar + mergedSoFar))
-            setWorking(formatQueueingLabel(remaining, totalItems))
+            setWorking(formatQueueingLabel(remaining))
         })
         let outcome = readOutcome(result, work)
         if(isThenable(outcome)) outcome = await outcome

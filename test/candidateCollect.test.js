@@ -85,7 +85,7 @@ test('the label reads zero and the minute mark for a run that has just started o
 test('the space loop exit lines are unchanged: the run-state condition, the end-of-feed confirm, and the away-from-bottom stall', () => {
     const body = functionBody(contentSource, 'async function collectMoreSpaceFeedPosts(button)')
     const loop = runnerSource()
-    assert.match(body, /isStopRequested: \(\) => spaceFeedCollectStopRequested,\s*isDone: \(\) => isSpaceFeedCollectDone\(startCount, peakCount, limit\),/)
+    assert.match(body, /isStopRequested: \(\) => spaceFeedCollectStopRequested,\s*isDone: \(\) => isSpaceFeedCollectDone\(startCount, peakCount, limit\) \|\| isCollectTimeUp\(spaceFeedCollectProgress\.startedAt, spaceFeedCollectSeconds\),/)
     // A pass that waited for a hidden tab counts as progress; every other pass is judged by collectPassMadeProgress (31 Oct).
     assert.match(body, /return resumed \|\| collectPassMadeProgress\(before, after\)/)
     assert.match(candidateSource, /return after\.count > before\.count \|\| after\.scrollY > before\.scrollY \|\| after\.scrollHeight > before\.scrollHeight/)
@@ -100,7 +100,7 @@ test('the space loop exit lines are unchanged: the run-state condition, the end-
 test('the search loop exit lines are unchanged: the stop and limit condition, the end-of-results return, and the stall timeout', () => {
     const body = functionBody(contentSource, 'async function collectMoreProfileSearchResults(button)')
     const loop = runnerSource()
-    assert.match(body, /isStopRequested: \(\) => profileSearchCollectStopRequested,\s*isDone: \(\) => collectedCount >= limit,/)
+    assert.match(body, /isStopRequested: \(\) => profileSearchCollectStopRequested,\s*isDone: \(\) => collectedCount >= limit \|\| isCollectTimeUp\(profileSearchCollectProgress\.startedAt, profileSearchCollectSeconds\),/)
     assert.match(body, /if\(collectedCount >= limit\) return 'done'/)
     assert.match(body, /if\(isProfileSearchEndOfResultsVisible\(\) && !hasUnstagedProfileSearchQueueableRow\(\) && !hasProfileSearchLoadingIndicator\(\)\) return 'end'/)
     assert.match(body, /madeProgress: collectPassMadeProgress,/)

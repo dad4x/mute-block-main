@@ -204,7 +204,9 @@ test('a state reply covers only the round asked about, so it is merged into the 
     const refresh = extractFunction(content, 'async function refreshContentPageCoordinatorStateFromRuntime(options = {})')
     const hrefs = extractFunction(content, 'function getCurrentPageStateProfileHrefs(options = {})')
 
-    assert.match(refresh, /coordinatorQueue = \{\s*\.\.\.dropCoordinatorQueueRowsForProfiles\(coordinatorQueue, profileHrefs\),\s*\.\.\.normalizeCoordinatorQueue\(result\.coordinatorQueue\)\s*\}/)
+    // The pending rows of the posts asked about are dropped too, when the reply covers them (6 Nov, postKeysCovered).
+    assert.match(refresh, /const queueAfterProfileDrop = dropCoordinatorQueueRowsForProfiles\(coordinatorQueue, profileHrefs\)/)
+    assert.match(refresh, /coordinatorQueue = \{\s*\.\.\.\(result\.postKeysCovered === true\s*\?\s*dropPendingCoordinatorRowsForPostKeys\(queueAfterProfileDrop, request\.postKeys, result\.coordinatorQueue\)\s*:\s*queueAfterProfileDrop\),\s*\.\.\.normalizeCoordinatorQueue\(result\.coordinatorQueue\)\s*\}/)
     assert.doesNotMatch(refresh, /coordinatorQueue = normalizeCoordinatorQueue\(result\.coordinatorQueue\)/)
     assert.match(refresh, /for\(const href of profileHrefs\) delete keptProgress\[href\]/)
     assert.match(refresh, /profileNukeProgress = \{\.\.\.keptProgress, \.\.\.repliedProgress\}/)

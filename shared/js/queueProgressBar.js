@@ -4,11 +4,12 @@
 // flow instead of pinning it to the bottom of the window (the #progress page is the whole window).
 const { BRAND_RED } = require('./colorTokens')
 const { setMuteBlockHelp } = require('./muteBlockHelp')
+const { MUTE_BLOCK_SITE_URL } = require('./muteBlockSite')
 
 function createQueueProgressBar(options = {}) {
     const barId = options.barId || 'mb-queue-progress'
     const darkMode = options.darkMode === true
-    // Interactive bars (the dashboard and #progress) take clicks on their logo and controls. The page bar never takes clicks, so it never blocks the page beneath it.
+    // Interactive bars (the dashboard and #progress) take clicks on their controls. The page bar never takes clicks, so it never blocks the page beneath it.
     const interactive = options.interactive === true
     const inline = options.inline === true
     const barBackground = darkMode ? 'rgba(32, 32, 35, 0.92)' : 'rgba(255, 255, 255, 0.92)'
@@ -49,22 +50,16 @@ function createQueueProgressBar(options = {}) {
     logo.height = 16
     logo.style.display = 'block'
 
-    if(typeof options.onLogoClick === 'function') {
-        const logoButton = document.createElement('button')
-        logoButton.type = 'button'
-        setMuteBlockHelp(logoButton, options.logoTitle || 'Open the dashboard')
-        logoButton.style.background = 'none'
-        logoButton.style.border = 'none'
-        logoButton.style.padding = '0'
-        logoButton.style.lineHeight = '0'
-        logoButton.style.cursor = 'pointer'
-        logoButton.append(logo)
-        logoButton.addEventListener('click', options.onLogoClick)
-        brand.append(logoButton)
-    }
-    else {
-        brand.append(logo)
-    }
+    // Every bar's logo is a link to the Mute Block site (owner, 6 Nov).
+    const logoLink = document.createElement('a')
+    logoLink.href = MUTE_BLOCK_SITE_URL
+    logoLink.target = '_blank'
+    logoLink.rel = 'noopener'
+    setMuteBlockHelp(logoLink, 'Open muteblock.quora.com')
+    logoLink.style.display = 'block'
+    logoLink.style.lineHeight = '0'
+    logoLink.append(logo)
+    brand.append(logoLink)
 
     const label = document.createElement('div')
     label.textContent = 'Progress'

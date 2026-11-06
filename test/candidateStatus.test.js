@@ -84,11 +84,11 @@ test('formatNukingStatus reads Nuking Paused in place of Nuking when the queue i
     assert.equal(formatNukingStatus({nuking: true, nukingLeft: 2}), 'Nuking... 2 left')
 })
 
-test('the Queueing batch label reads Queueing... with the count still to queue', () => {
+test('the Queueing batch label counts down: Queueing N..., and Queueing... once nothing is left to count (6 Nov)', () => {
     assert.equal(formatQueueingLabel(), 'Queueing...')
-    assert.equal(formatQueueingLabel(0, 5), 'Queueing...')
-    assert.equal(formatQueueingLabel(2, 5), 'Queueing... 2 of 5')
-    assert.equal(formatQueueingLabel(-1, 5), 'Queueing...')
+    assert.equal(formatQueueingLabel(0), 'Queueing...')
+    assert.equal(formatQueueingLabel(5), 'Queueing 5...')
+    assert.equal(formatQueueingLabel(-1), 'Queueing...')
 })
 
 test('the Nuking label reads Nuking... with the count left when there is one', () => {

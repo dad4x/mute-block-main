@@ -25165,6 +25165,7 @@ test('queued live-tab recovery adopts resolve-profile worker-surface tab by requ
         active: true
     }
     browser.__tabs.set(materializedTab.id, materializedTab)
+    sw.__testRecordQueueCreatedWorkerTab(materializedTab.id)
 
     const result = await sw.recoverQueuedAuthorityLiveTabAfterMaterializationFailure(
         storage.mbCoordinatorQueue[key],
@@ -32017,6 +32018,7 @@ test('service-worker executor adopts orphaned worker-window resolve-profile tab 
         url: requestedUrl,
         active: true
     })
+    sw.__testRecordQueueCreatedWorkerTab(sourceTab.id)
 
     const result = await sw.resumeCoordinatorQueueExecutionOnce({
         tabId: 'service-worker-queue-owner',
@@ -46065,6 +46067,13 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         collectPassMadeProgress: require('../shared/js/candidateCollect').collectPassMadeProgress,
         reportCollectEnd: () => {},
         formatCollectStopLabel: require('../shared/js/candidateCollect').formatCollectStopLabel,
+        isCollectTimeUp: require('../shared/js/candidateCollect').isCollectTimeUp,
+        formatCollectingLabel: require('../shared/js/candidateCollect').formatCollectingLabel,
+        collectChoiceLabel: require('../shared/js/candidateCollect').collectChoiceLabel,
+        parseCollectChoice: require('../shared/js/candidateCollect').parseCollectChoice,
+        collectTimeValue: require('../shared/js/candidateCollect').collectTimeValue,
+        formatMinutesSeconds: require('../shared/js/candidateCollect').formatMinutesSeconds,
+        COLLECT_TIME_SECONDS: [5, 10, 30, 60, 120, 300],
         formatCollectEndNotice: require('../shared/js/candidateCollect').formatCollectEndNotice,
         // The collect result under the button is a page detail; these collect tests only check the collect (5 Nov).
         setCollectResult: (element, reason) => { notices.push(reason) },
@@ -46089,6 +46098,8 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         'let spaceFeedCollecting = false',
         'let spaceFeedCollectStopRequested = false',
         'let spaceFeedCollectLimit = 10',
+        'let spaceFeedCollectSeconds = 0',
+        'function currentSpaceFeedCollectLabel() { return collectChoiceLabel(spaceFeedCollectSeconds ? {seconds: spaceFeedCollectSeconds} : {limit: spaceFeedCollectLimit}) }',
         'let spaceFeedCollectProgress = {startedAt: 0, passes: 0, collected: 0, target: 0}',
         'let spaceFeedStopLabelTimer = 0',
         'const spaceFeedPosterProfileHrefs = new Set()',
@@ -46153,6 +46164,13 @@ function makeSearchCollectHarness(stopOnPass = 0) {
         // The end event is recorded so a test can read the detail (considered, the count of distinct result rows).
         reportCollectEnd: (page, detail) => { reports.push({page, ...detail}) },
         formatCollectStopLabel: require('../shared/js/candidateCollect').formatCollectStopLabel,
+        isCollectTimeUp: require('../shared/js/candidateCollect').isCollectTimeUp,
+        formatCollectingLabel: require('../shared/js/candidateCollect').formatCollectingLabel,
+        collectChoiceLabel: require('../shared/js/candidateCollect').collectChoiceLabel,
+        parseCollectChoice: require('../shared/js/candidateCollect').parseCollectChoice,
+        collectTimeValue: require('../shared/js/candidateCollect').collectTimeValue,
+        formatMinutesSeconds: require('../shared/js/candidateCollect').formatMinutesSeconds,
+        COLLECT_TIME_SECONDS: [5, 10, 30, 60, 120, 300],
         formatCollectEndNotice: require('../shared/js/candidateCollect').formatCollectEndNotice,
         // The collect result under the button is a page detail; these collect tests only check the collect (5 Nov).
         setCollectResult: (element, reason) => { notices.push(reason) },
@@ -46196,6 +46214,9 @@ function makeSearchCollectHarness(stopOnPass = 0) {
     })
     vm.runInContext([
         'let profileSearchCollecting = false',
+        'let profileSearchCollectSeconds = 0',
+        'let profileSearchCollectLimit = 10',
+        'function currentProfileSearchCollectLabel() { return collectChoiceLabel(profileSearchCollectSeconds ? {seconds: profileSearchCollectSeconds} : {limit: profileSearchCollectLimit}) }',
         'let profileSearchCollectStopRequested = false',
         'let profileSearchProcessedFollowButtons = new WeakSet()',
         'let profileSearchCollectCursorScrollY = 0',

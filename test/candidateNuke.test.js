@@ -146,7 +146,7 @@ asyncTest('runBatchNuke runs the page hooks in order: queue, work, count, mark, 
         'onQueued:1',
         'beforePress',
         'press',
-        'working:Queueing...',
+        'working:Queueing 1...',
         'afterWorking',
         'send:a',
         'working:Queueing...',
@@ -179,8 +179,8 @@ asyncTest('runBatchNuke turns the send progress into the Queueing label, countin
     }
     h.refreshGate.resolve(true)
     await runBatchNuke(h.hooks)
-    // Pressed: 'Queueing...'. The first chunk settled with 1 queued and 1 merged, so 1 of 3 is still to go. The second leaves none.
-    assert.deepEqual(labels, ['Queueing...', 'Queueing... 1 of 3', 'Queueing...'])
+    // Pressed: 'Queueing 3...'. The first chunk settled with 1 queued and 1 merged, so 1 is still to go. The second leaves none.
+    assert.deepEqual(labels, ['Queueing 3...', 'Queueing 1...', 'Queueing...'])
 })
 
 asyncTest('runBatchNuke awaits a page hook that returns a promise, and passes the outcome of a read that waits', async() => {

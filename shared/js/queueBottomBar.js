@@ -20,9 +20,9 @@ function pauseButtonLabel(paused, pending) {
     return paused ? 'Resume' : 'Pause'
 }
 
-// Builds the bar on the current page and returns its handle. `onLogoClick` is the bar's logo; `onPauseClick` runs when Pause or Resume is
-// pressed. The bar is hidden until update() says the queue has work left.
-function createQueueBottomBar({onLogoClick = null, onPauseClick = null, logoTitle = 'Open the dashboard'} = {}) {
+// Builds the bar on the current page and returns its handle. The logo is a link to the Mute Block site (queueProgressBar.js); `onPauseClick`
+// runs when Pause or Resume is pressed. The bar is hidden until update() says the queue has work left.
+function createQueueBottomBar({onPauseClick = null} = {}) {
     const pauseButton = document.createElement('button')
     pauseButton.type = 'button'
     pauseButton.className = 'clear-button pause-toggle'
@@ -35,8 +35,6 @@ function createQueueBottomBar({onLogoClick = null, onPauseClick = null, logoTitl
         barId: 'queueBottomBar',
         iconSrc: 'icons/32.png',
         interactive: true,
-        logoTitle,
-        onLogoClick: () => { if(typeof onLogoClick === 'function') void onLogoClick() },
         controls: [pauseButton]
     })
     progress.bar.style.display = 'none'

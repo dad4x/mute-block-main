@@ -65,6 +65,8 @@ function loadSpacePage(clock, descriptor, registryMap) {
     const context = vm.createContext({
         Date: {now: () => clock.now},
         PROFILE_SEARCH_COLLECT_CHOICES: tunables.PROFILE_SEARCH_COLLECT_CHOICES,
+        parseCollectChoice: require('../shared/js/candidateCollect').parseCollectChoice,
+        COLLECT_TIME_SECONDS: [5, 10, 30, 60, 120, 300],
         resolveCurrentSpaceDescriptor: () => descriptor,
         syncSpaceClassificationControls: () => {},
         scheduleSpaceAssetNukeControls: () => {},

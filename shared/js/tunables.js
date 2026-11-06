@@ -132,7 +132,11 @@ module.exports = {
     // dropdown's choice is kept for that search page only, in memory: it is not saved, and it resets on reload or a new search.
     // "Nuke 'Em" keeps the default count.
     PROFILE_SEARCH_COLLECT_LIMIT: 100,
+    // A new search page starts on this time, "Collect for 00:10" (7 Nov). It is one of COLLECT_TIME_SECONDS.
+    PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS: 10,
     PROFILE_SEARCH_COLLECT_CHOICES: [25, 50, 100, 250, 500, 1000, 2000],
+    // Collect for a time instead of a count (7 Nov): the dropdown offers these, in seconds, after the counts.
+    COLLECT_TIME_SECONDS: [5, 10, 30, 60, 120, 300],
 
     // Scrolling in the collect loops and the modal nuke (content.js). The wait after each scroll before the page is read again. Quora
     // slows down deeper into a feed, so a feed that stops growing at the bottom only counts as ended after COLLECT_END_CONFIRM_MS.

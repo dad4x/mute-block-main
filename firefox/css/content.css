@@ -150,6 +150,15 @@
     opacity: 1;
 }
 
+/* While a collect runs, Nuke 'Em on the space page and in the contributors popup is held and greyed (7 Nov). The gate sets the attribute
+   (applyCollectNukeGate), so the grey look is the same one a disabled Nuke 'Em 0 has. */
+.mb-ext_nuke-profiles-btn[data-mb-collect-gated="true"]:disabled {
+    background-color: #f3f4f6;
+    color: #7b8494;
+    border-color: rgba(123, 132, 148, 0.24);
+    box-shadow: none;
+}
+
 /* A Nuke 'Em that a running collect holds (4 Nov): disabled and dimmed, so it reads as unavailable, not broken. */
 .mb-ext_nuke-profiles-btn[data-mb-collect-gated="true"] {
     cursor: not-allowed;
@@ -305,6 +314,8 @@
     border-color: #000;
 }
 
+/* Any Nuke 'Em that is disabled and not carrying a status (working, done, bad links) reads grey, the look of Nuke 'Em 0 (7 Nov). */
+.mb-ext_nuke-profiles-btn:disabled:not(.mb-ext_nuke-profiles-btn--working):not(.mb-ext_nuke-profiles-btn--done):not(.mb-ext_nuke-profiles-btn--bad-links):not(.mb-ext_nuke-profiles-btn--status),
 .mb-ext_profile-search-toolbar .mb-ext_nuke-profiles-btn:disabled,
 .mb-ext_profile-search-action-host .mb-ext_nuke-profiles-btn:disabled {
     background-color: #f3f4f6;
@@ -521,6 +532,11 @@
 /* The queue's status beside the Nuke 'Em button and the batch button (owner, 25 Oct): a display only, so it does not hold either button. */
 /* One rule for both batch toolbars (28 Oct): the space page and the search page use the same class (NUKING_TOOLBAR_STATUS_CLASS in content.js). */
 /* The toolbar status is a status box, not a pill (5 Nov): pause is in the progress bar, so there is no drop-down beside it. */
+/* The status span is a placeholder for the nuking control when it has no words to show: it must not draw an empty pill (7 Nov). */
+.mb-ext_nuking-status:empty {
+    display: none;
+}
+
 .mb-ext_nuking-status {
     background: #fff;
     border: 1px solid #d1d5db;

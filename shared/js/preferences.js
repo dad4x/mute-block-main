@@ -43,7 +43,6 @@ let queueBottomBar = null
 
 function installPreferencesQueueBar() {
     queueBottomBar = createQueueBottomBar({
-        onLogoClick: () => { void openExtensionPageFromHere(browser, {page: 'dashboard', clickedAt: Date.now(), report: reportPreferencesPageOpen}) },
         onPauseClick: () => { void togglePreferencesQueuePause() }
     })
 }

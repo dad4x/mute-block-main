@@ -33,6 +33,8 @@ const {
     getSpaceName,
     normalizeSpaceCategory,
     normalizeSpaceCollectCount,
+    normalizeSpaceCollectSeconds,
+    withSpaceRecordCollectSeconds,
     normalizeSpaceUrl,
     withSpaceRecordCollectCount
 } = require('./spaceRegistry')
@@ -57,7 +59,7 @@ const {
 } = require('./storageKeys')
 const {namespaceArea, namespaceChanges} = require('./storageNamespace')
 const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS, SPACE_FEED_STATE_RETRY_MS, CONTENT_PROGRESS_BAR_POLL_MS, SPACE_FEED_STATE_POLL_MS, OWNED_NUKE_STATUS_TTL_MS, OWNED_NUKE_STATUS_WAIT_MS, SPACE_FEED_RENDER_MIN_GAP_MS, SPACE_FEED_PROFILE_LINK_CARD_CACHE_MS, SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS, SPACE_FEED_CONTENT_ROOT_MEMO_MS, SPACE_FEED_SCAN_REUSE_MS, SPACE_FEED_SCAN_BAND_DOWN_PX, SPACE_FEED_SCAN_BAND_UP_PX, SPACE_FEED_RENDER_MODEL_MEMO_MS} = require('./tunables')
-const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_SCROLL_PASS_WAIT_MS, COLLECT_END_CONFIRM_MS, MODAL_PROFILE_NUKE_SCROLL_WAIT_MS, COLLECT_STALLED_TIMEOUT_MS, COLLECT_STOP_LABEL_TICK_MS, CANDIDATE_BATCH_PROFILES_PER_BATCH, COLLECT_ADAPTIVE_WAIT_MAX_MS, COLLECT_ADAPTIVE_END_SILENT_PASSES} = require('./tunables')
+const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_TIME_SECONDS, COLLECT_SCROLL_PASS_WAIT_MS, COLLECT_END_CONFIRM_MS, MODAL_PROFILE_NUKE_SCROLL_WAIT_MS, COLLECT_STALLED_TIMEOUT_MS, COLLECT_STOP_LABEL_TICK_MS, CANDIDATE_BATCH_PROFILES_PER_BATCH, COLLECT_ADAPTIVE_WAIT_MAX_MS, COLLECT_ADAPTIVE_END_SILENT_PASSES} = require('./tunables')
 const {installButtonPressListener} = require('./buttonPressEvents')
 const {
     WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS,
@@ -99,6 +101,7 @@ const {
 const {createEnqueueMarkStore} = require('./candidateMarks')
 const {formatCollectStopLabel, formatCollectEndNotice, formatElapsed, STOP_COLLECT_LABEL_TEXT} = require('./candidateCollect')
 const {collectPassMadeProgress, runCollectLoop, createAdaptiveCollectWait} = require('./candidateCollect')
+const {collectTimeValue, parseCollectChoice, formatMinutesSeconds, collectChoiceLabel, isCollectTimeUp, formatCollectingLabel} = require('./candidateCollect')
 const {runBatchNuke} = require('./candidateNuke')
 const {NOTHING_QUEUED_LABEL, NUKED_LABEL, formatToolbarNukingStatus, formatProfileRowState} = require('./candidateStatus')
 const {nukingControlView, nukingStatusShowsControl, spaceFeedNukingToolbar} = require('./nukingControl')
@@ -250,6 +253,8 @@ let profileSearchStopLabelTimer = 0
 let profileSearchCollectionKey = ''
 // The Collect N More count, for this search page only. It is kept in memory: it is not saved, and it resets when the search changes or the page reloads.
 let profileSearchCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
+// The search page's time choice in seconds; 0 means the count is in use (7 Nov). In memory only, like the count.
+let profileSearchCollectSeconds = PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS
 let profileSearchStagedHrefs = []
 let profileSearchStagedHrefSet = new Set()
 let profileSearchCollectCursorScrollY = 0
@@ -281,6 +286,8 @@ let spaceFeedScrollActiveUntil = 0
 let latestSpaceFeedEntries = []
 // Space pages: the Collect N More count (in memory, for this space page only) and the run state of its collect.
 let spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
+// The space's time choice in seconds; 0 means the count is in use (7 Nov). Kept on the space's record, like the count.
+let spaceFeedCollectSeconds = PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS
 let spaceFeedCollectKey = ''
 let spaceFeedCollecting = false
 let spaceFeedCollectStopRequested = false
@@ -426,6 +433,8 @@ async function init() {
     browser.runtime.onMessage.addListener(onMessage)
     const initialPage = getPageType()
     // Every press on the extension's own buttons on this page is recorded and flashed (6 Nov). The site's buttons are not selected.
+    // DIAGNOSTIC (7 Nov): remove with installPageExitDiagnostics below. Records a page's errors (first 20) and how the page went away.
+    installPageExitDiagnostics()
     installButtonPressListener({
         selector: 'button[class*="mb-ext_"]',
         report: label => reportPageEvent('button-press', `${getPageType()} ${label}`)
@@ -643,7 +652,11 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
         profileHrefs,
         sourcePageUrl: page === 'profile-search' ? normalizeCurrentProfileSearchPageUrl() : '',
         searchQuery: page === 'profile-search' ? new URLSearchParams(location.search).get('q') || '' : '',
-        runId: page === 'profile-search' ? profileSearchLastRunId || '' : ''
+        runId: page === 'profile-search' ? profileSearchLastRunId || '' : '',
+        // The space page names the posts of its pending rows, so the reply can say whether each one is still live (6 Nov).
+        postKeys: page === 'space' ? getPendingCoordinatorPostKeys() : [],
+        // The question logs of the resolver candidates on this page, so the reply can name the ones a completed row settles (6 Nov).
+        chaseUrls: page === 'space' ? getSpaceFeedResolverChaseUrls() : []
     }
 
     const stateRequestStartedAt = Date.now()
@@ -672,8 +685,13 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
             if(result.coordinatorQueue && typeof result.coordinatorQueue === 'object') {
                 // The reply holds every live row of the profiles asked about, so a row of one of them that the reply lacks has left the live
                 // queue (finished and archived). Drop this page's copy of it too, or it stays "pending" (24 Oct: 507 left after a finished run).
+                // 6 Nov: when the reply says it holds every live row of the posts asked about (postKeysCovered), a pending row of those posts
+                // that the reply lacks has left the queue. Unresolved posts have no profile, so the profile drop above never reaches them.
+                const queueAfterProfileDrop = dropCoordinatorQueueRowsForProfiles(coordinatorQueue, profileHrefs)
                 coordinatorQueue = {
-                    ...dropCoordinatorQueueRowsForProfiles(coordinatorQueue, profileHrefs),
+                    ...(result.postKeysCovered === true
+                        ? dropPendingCoordinatorRowsForPostKeys(queueAfterProfileDrop, request.postKeys, result.coordinatorQueue)
+                        : queueAfterProfileDrop),
                     ...normalizeCoordinatorQueue(result.coordinatorQueue)
                 }
                 coordinatorQueueLoaded = true
@@ -681,6 +699,17 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
                 applySpaceFeedEnqueueMarksToStateReply(stateRequestStartedAt, profileHrefs, coordinatorQueue)
                 // The search page's marks take over the same way, from the rows this reply shows (see applyProfileSearchEnqueueMarksToStateReply).
                 applyProfileSearchEnqueueMarksToStateReply(stateRequestStartedAt, profileHrefs, coordinatorQueue)
+            }
+            if(Array.isArray(result.settledChaseUrls)) {
+                // The worker names the URLs asked about that a completed row settles. Settled stays settled until the page reloads (6 Nov).
+                let addedSettled = false
+                for(const url of result.settledChaseUrls) {
+                    if(settledSpaceFeedChaseUrls.has(url)) continue
+                    settledSpaceFeedChaseUrls.add(url)
+                    addedSettled = true
+                }
+                for(const url of Array.isArray(request.chaseUrls) ? request.chaseUrls : []) spaceFeedChaseChecked.add(url)
+                if(addedSettled) spaceFeedRenderModelMemo = null
             }
             if(result.profileNukeProgress && typeof result.profileNukeProgress === 'object') {
                 // Progress is keyed by profile: the profiles asked about this round take the reply's records, and a profile with no record in the reply has none.
@@ -1520,6 +1549,22 @@ function reportInitialBlockedStateIfQueued(blocked) {
 // misclassifying a genuine live block as already-blocked.
 // Diagnostic events for the flight recorder: what the user did on the page and when the page's blocked
 // state changed. Stamped with this page's clock so they line up with the worker's own events.
+// DIAGNOSTIC (7 Nov): remove with the call in init above. A page error or an exit (pagehide) is recorded with its tab, so a vanished tab can be matched.
+let diagnosticPageErrorCount = 0
+function installPageExitDiagnostics() {
+    addEventListener('error', event => {
+        if (diagnosticPageErrorCount++ >= 20) return
+        reportPageEvent('page-error', `${event?.message || 'error'}`.slice(0, 70))
+    })
+    addEventListener('unhandledrejection', event => {
+        if (diagnosticPageErrorCount++ >= 20) return
+        reportPageEvent('page-rejection', `${event?.reason?.message || event?.reason || 'rejection'}`.slice(0, 70))
+    })
+    addEventListener('pagehide', event => {
+        reportPageEvent('page-exit', `${event?.persisted ? 'cached' : 'gone'} ${document.visibilityState || ''}`)
+    })
+}
+
 function reportPageEvent(event, detail = '') {
     void safeSendRuntimeMessage({
         action: 'record-page-event',
@@ -1529,7 +1574,7 @@ function reportPageEvent(event, detail = '') {
     }).catch(() => null)
 }
 
-// Owner, 27 Oct: every collect run ends with one flight recorder event saying why. reason is 'captured' (the count was reached),
+// Owner, 27 Oct: every collect run ends with one flight recorder event saying why. reason is 'captured' (the count was reached), 'time-up' (the time limit ran out, 7 Nov),
 // 'end-of-feed' (or end-of-results on search), 'stalled' (the page stopped growing), or 'stopped' (Stop was pressed).
 // considered (search only, owner 27 Oct) is the count of distinct result rows the run read; it is added as "seen N" when given.
 function reportCollectEnd(page, {reason, collected, limit, passes, startedAt, considered = null}) {
@@ -2849,6 +2894,8 @@ function pruneNukingControls() {
 
 function attachNukingControl(anchor, left = 0) {
     if(!anchor || !anchor.isConnected || !anchor.parentNode) return
+    // The search page's Nuke 'Em never carries the drop-down: it sits beside the status (7 Nov). A control left on the button showed as a blank oval.
+    if(anchor.classList?.contains('mb-ext_profile-search-batch-btn')) return
     pruneNukingControls()
     let control = nukingControlByAnchor.get(anchor)
     if(!control || !control.isConnected) {
@@ -7038,7 +7085,10 @@ function ensureSpaceFeedCollectStateForCurrentSpace() {
     if(spaceFeedCollectKey === key) return
 
     spaceFeedCollectKey = key
-    spaceFeedCollectLimit = normalizeSpaceCollectCount(getStoredSpaceRecord(resolveCurrentSpaceDescriptor())?.collectCount)
+    const storedSpaceRecord = getStoredSpaceRecord(resolveCurrentSpaceDescriptor())
+    spaceFeedCollectLimit = normalizeSpaceCollectCount(storedSpaceRecord?.collectCount)
+    // A space with no record yet starts on the default time (7 Nov).
+    spaceFeedCollectSeconds = storedSpaceRecord ? normalizeSpaceCollectSeconds(storedSpaceRecord.collectSeconds) : PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS
 }
 
 // The registry can load after the page starts, and another tab can change the count. A space with no record keeps its in-memory count.
@@ -7047,22 +7097,54 @@ function syncSpaceFeedCollectLimitFromRecord() {
     if(!record) return
 
     spaceFeedCollectLimit = normalizeSpaceCollectCount(record.collectCount)
+    spaceFeedCollectSeconds = normalizeSpaceCollectSeconds(record.collectSeconds)
     if(!spaceFeedCollecting) syncSpaceFeedCollectButton()
 }
 
-// Only a count the dropdown offers is taken. It applies to this space page, and to the space's record when it has one.
+// Only a count or a time the dropdown offers is taken (7 Nov). It applies to this space page, and to the space's record when it has one.
 function setSpaceFeedCollectLimit(value) {
-    if(!PROFILE_SEARCH_COLLECT_CHOICES.includes(value)) return
-    spaceFeedCollectLimit = value
+    const choice = parseCollectChoice(value, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_TIME_SECONDS)
+    if(!choice) return
+    if(choice.seconds) {
+        spaceFeedCollectSeconds = choice.seconds
+        syncSpaceFeedCollectButton()
+        void persistSpaceFeedCollectSeconds(choice.seconds)
+        return
+    }
+    spaceFeedCollectLimit = choice.limit
+    spaceFeedCollectSeconds = 0
     syncSpaceFeedCollectButton()
-    void persistSpaceFeedCollectCount(value)
+    void persistSpaceFeedCollectCount(choice.limit)
+}
+
+// The Collect button's words for the space's current choice.
+function currentSpaceFeedCollectLabel() {
+    return collectChoiceLabel(spaceFeedCollectSeconds ? {seconds: spaceFeedCollectSeconds} : {limit: spaceFeedCollectLimit})
+}
+
+// A time choice is written into the space's record the way a count is (7 Nov). The count the record keeps stays as it was.
+async function persistSpaceFeedCollectSeconds(seconds) {
+    const record = getStoredSpaceRecord(resolveCurrentSpaceDescriptor())
+    if(!record || record.collectSeconds === seconds) return
+
+    const recordKey = Object.keys(spaceRegistry).find(key => spaceRegistry[key] === record)
+    if(!recordKey) return
+
+    const nextRecord = withSpaceRecordCollectSeconds(record, seconds)
+    if(!nextRecord) return
+
+    spaceRegistry = {
+        ...spaceRegistry,
+        [recordKey]: nextRecord
+    }
+    await safeSendRuntimeMessage({action: 'set-space-record', key: recordKey, change: {collectSeconds: seconds}, at: Date.now()}, null)
 }
 
 // The count is written into the space's registry record through the same door the category buttons use, as a change to that one record.
 // A space with no record (no category) has nowhere to keep it, so nothing is written and the count stays in memory.
 async function persistSpaceFeedCollectCount(value) {
     const record = getStoredSpaceRecord(resolveCurrentSpaceDescriptor())
-    if(!record || record.collectCount === value) return
+    if(!record || (record.collectCount === value && !record.collectSeconds)) return
 
     const recordKey = Object.keys(spaceRegistry).find(key => spaceRegistry[key] === record)
     if(!recordKey) return
@@ -7140,7 +7222,8 @@ function refreshSpaceFeedStopLabel() {
         collected: spaceFeedCollectProgress.collected,
         target: spaceFeedCollectProgress.target,
         passes: spaceFeedCollectProgress.passes,
-        elapsedMs: Date.now() - spaceFeedCollectProgress.startedAt
+        elapsedMs: Date.now() - spaceFeedCollectProgress.startedAt,
+        timeLimitMs: spaceFeedCollectSeconds * 1000
     })
     if(stopButton.textContent !== label) stopButton.textContent = label
 }
@@ -7181,7 +7264,8 @@ function waitForSpaceFeedTabVisible() {
 }
 
 async function collectMoreSpaceFeedPosts(button) {
-    const limit = spaceFeedCollectLimit
+    // A time choice has no count limit: the run stops on the clock instead (7 Nov).
+    const limit = spaceFeedCollectSeconds ? Number.POSITIVE_INFINITY : spaceFeedCollectLimit
     if(spaceFeedCollecting) {
         requestSpaceFeedCollectStop()
         return false
@@ -7191,7 +7275,7 @@ async function collectMoreSpaceFeedPosts(button) {
     spaceFeedCollecting = true
     spaceFeedCollectStopRequested = false
     setSpaceFeedNukeCollectGate(true)
-    spaceFeedCollectProgress = {startedAt: Date.now(), passes: 0, collected: 0, target: limit}
+    spaceFeedCollectProgress = {startedAt: Date.now(), passes: 0, collected: 0, target: spaceFeedCollectLimit}
     syncSpaceFeedStopButtons()
     let endReached = false
     try {
@@ -7199,7 +7283,7 @@ async function collectMoreSpaceFeedPosts(button) {
         const startCount = readSpaceFeedCollectedCount()
         let peakCount = startCount
         setSpaceFeedCollectButtons(collectButton => clearCollectResult(collectButton))
-        setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, `Collecting 0 / ${limit}`))
+        setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, formatCollectingLabel({target: limit, timeSeconds: spaceFeedCollectSeconds, startedAt: spaceFeedCollectProgress.startedAt})))
 
         // First operation: go to the end of the feed, so Quora loads the next batch. The loop then scrolls down through what loads.
         // A stop pressed during the animation skips it.
@@ -7214,7 +7298,7 @@ async function collectMoreSpaceFeedPosts(button) {
         const adaptiveWait = createAdaptiveCollectWait({floorMs: COLLECT_SCROLL_PASS_WAIT_MS, ceilingMs: COLLECT_ADAPTIVE_WAIT_MAX_MS})
         const outcome = await runCollectLoop({
             isStopRequested: () => spaceFeedCollectStopRequested,
-            isDone: () => isSpaceFeedCollectDone(startCount, peakCount, limit),
+            isDone: () => isSpaceFeedCollectDone(startCount, peakCount, limit) || isCollectTimeUp(spaceFeedCollectProgress.startedAt, spaceFeedCollectSeconds),
             snapshot: () => ({count: peakCount, scrollY: window.scrollY || 0, scrollHeight: document.documentElement.scrollHeight}),
             pass: async () => {
                 if(document.visibilityState !== 'visible' && !spaceFeedCollectStopRequested) {
@@ -7233,7 +7317,7 @@ async function collectMoreSpaceFeedPosts(button) {
                 // A pass counts once its read has run, so the label's count and passes always describe the same reads.
                 spaceFeedCollectProgress.collected = getSpaceFeedCollectedSince(startCount, peakCount)
                 spaceFeedCollectProgress.passes += 1
-                setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, `Collecting ${getSpaceFeedCollectedSince(startCount, peakCount)} / ${limit}`))
+                setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, formatCollectingLabel({staged: getSpaceFeedCollectedSince(startCount, peakCount), target: limit, timeSeconds: spaceFeedCollectSeconds, startedAt: spaceFeedCollectProgress.startedAt})))
             },
             madeProgress: (before, after) => {
                 const resumed = resumedFromHiddenTab
@@ -7249,7 +7333,7 @@ async function collectMoreSpaceFeedPosts(button) {
         const collected = getSpaceFeedCollectedSince(startCount, peakCount)
         void weedSpaceFeedPosterRows().catch(() => null)
         reportCollectEnd('space', {
-            reason: spaceFeedCollectStopRequested ? 'stopped' : collected >= limit ? 'captured' : endReached ? 'end-of-feed' : 'stalled',
+            reason: spaceFeedCollectStopRequested ? 'stopped' : collected >= limit ? 'captured' : isCollectTimeUp(spaceFeedCollectProgress.startedAt, spaceFeedCollectSeconds) ? 'time-up' : endReached ? 'end-of-feed' : 'stalled',
             collected,
             limit,
             passes: spaceFeedCollectProgress.passes,
@@ -7417,7 +7501,7 @@ function getCollectWrap(button) {
 
 function setCollectResult(button, reason, limit) {
     if(!button) return
-    setNukeButtonIdle(button, `Collect ${limit} More`)
+    setNukeButtonIdle(button, currentSpaceFeedCollectLabel())
     const wrap = getCollectWrap(button)
     if(!wrap) return
     let result = wrap.querySelector('.mb-ext_collect-result')
@@ -7459,12 +7543,13 @@ function syncSpaceFeedCollectButton(options = {}) {
         })
         setMuteBlockHelp(button, `Scroll and collect up to ${limit} more posts before stopping.`)
         const select = ensureCurrentInstanceClickHandler(wrap.querySelector('.mb-ext_profile-search-collect-limit'), 'space-feed-collect-limit', event => {
-            setSpaceFeedCollectLimit(Number.parseInt(event.currentTarget.value, 10))
+            setSpaceFeedCollectLimit(event.currentTarget.value)
             // Choosing a count only sets it; the collect starts from the Collect button (owner, 26 Oct).
         }, 'change')
-        if(!spaceFeedCollecting && !options.keepLabel) setNukeButtonIdle(button, `Collect ${limit} More`)
+        if(!spaceFeedCollecting && !options.keepLabel) setNukeButtonIdle(button, currentSpaceFeedCollectLabel())
         if(select) {
-            if(select.value !== String(limit)) select.value = String(limit)
+            const selectValue = spaceFeedCollectSeconds ? collectTimeValue(spaceFeedCollectSeconds) : String(limit)
+            if(select.value !== selectValue) select.value = selectValue
             select.disabled = spaceFeedCollecting
         }
     }
@@ -8815,6 +8900,54 @@ function dropCoordinatorQueueRowsForProfiles(queue = {}, profileHrefs = []) {
     return Object.fromEntries(Object.entries(queue || {}).filter(([itemKey, item]) => !asked.has(getCoordinatorItemProfileHref(itemKey, item))))
 }
 
+// The question logs of this page's resolver candidates that the worker has not been asked about yet (6 Nov). The candidate list is built from
+// the remembered entries (getDiscoveredSpaceFeedEntries), so the URLs come from that store. A URL is asked once: a completed row settles it
+// for good, and an unsettled one is asked again only after this page's next enqueue (spaceFeedChaseChecked is cleared there).
+let spaceFeedChaseChecked = new Set()
+
+function getSpaceFeedResolverChaseUrls() {
+    const urls = new Set()
+    for(const entry of getDiscoveredSpaceFeedEntries()) {
+        const url = `${entry?.resolutionUrl || ''}`.trim()
+        if(!url || !entry?.resolveProfileFromPage) continue
+        if(settledSpaceFeedChaseUrls.has(url) || spaceFeedChaseChecked.has(url)) continue
+        urls.add(url)
+    }
+    return Array.from(urls)
+}
+
+// The chase URLs the worker's last state reply settled: a candidate with one of them is merged into a completed row, not queued (6 Nov).
+let settledSpaceFeedChaseUrls = new Set()
+
+function isSettledSpaceFeedChase(entry = null) {
+    return settledSpaceFeedChaseUrls.has(`${entry?.resolutionUrl || ''}`.trim())
+}
+
+// The post keys of this page's pending rows (6 Nov). The state request names them so the reply can say which of these rows are still live.
+function getPendingCoordinatorPostKeys() {
+    const postKeys = new Set()
+    for(const item of Object.values(coordinatorQueue || {})) {
+        if(!isPendingCoordinatorStatus(item?.status)) continue
+        for(const evidence of Array.isArray(item?.evidence) ? item.evidence : []) {
+            const postKey = `${evidence?.postKey || ''}`.trim()
+            if(postKey) postKeys.add(postKey)
+        }
+    }
+    return Array.from(postKeys)
+}
+
+// Drops this page's pending rows of the asked posts that the reply lacks. A row the reply holds is kept, and the merge after it takes the
+// reply's copy. Only meaningful when the reply says postKeysCovered (see addLiveCoordinatorRowsForPostKeys in sw.js).
+function dropPendingCoordinatorRowsForPostKeys(queue, postKeys = [], repliedQueue) {
+    const asked = new Set(Array.isArray(postKeys) ? postKeys : [])
+    if(!asked.size) return {...queue}
+    return Object.fromEntries(Object.entries(queue || {}).filter(([itemKey, item]) => {
+        if(!isPendingCoordinatorStatus(item?.status)) return true
+        if(Object.prototype.hasOwnProperty.call(repliedQueue || {}, itemKey)) return true
+        return !(Array.isArray(item?.evidence) && item.evidence.some(evidence => asked.has(`${evidence?.postKey || ''}`.trim())))
+    }))
+}
+
 function getCoordinatorItemProfileHref(itemKey = '', item = null) {
     return normalizeQuoraProfileHref(
         item?.targetProfileHref ||
@@ -9121,12 +9254,20 @@ function getSpaceFeedBadLinkDetail(href, record = null) {
     const landedHref = normalizeQuoraProfileHref(record?.resolvedProfileHref || '') ||
         normalizeQuoraProfileHref(`${record?.unavailableReason || ''}`.match(/redirected from \S+ to (\S+)$/)?.[1] || '') || ''
     const redirected = !!landedHref && landedHref !== requestedHref
+    // An account Quora banned, deactivated, inactivated or deleted reads as that, whatever else the record says (6 Nov): a redirect that
+    // lands on such a page is the banned account, not a mismatch.
+    const enforcedWord = /\b(banned|deactivated|inactivated|deleted)\b/
+    const recordedEnforced = `${record?.unavailableReason || ''}`.match(enforcedWord)
+    const signal = `${record?.status || ''} ${record?.finalError || ''}`.toLowerCase().match(enforcedWord)
+    const reason = recordedEnforced
+        ? record.unavailableReason
+        : signal ? signal[1] : (redirected ? `redirected to ${landedHref.split('/profile/')[1] || landedHref}` : (record?.unavailableReason || record?.finalError || record?.status || 'unavailable'))
     return {
         href: requestedHref,
         name,
         // 1 Nov: a record with no unavailable reason still says what it recorded: its final error, then its status. "unavailable" is the
         // fallback only when there is no record at all.
-        reason: redirected ? `redirected to ${landedHref.split('/profile/')[1] || landedHref}` : (record?.unavailableReason || record?.finalError || record?.status || 'unavailable')
+        reason
     }
 }
 
@@ -9199,6 +9340,7 @@ function isQueueableSpaceFeedResolverEntry(entry) {
     if(getNormalizedProfileHrefList(entry?.candidateUrls || []).length) return false
     if(isSpaceFeedEntryNuked(entry)) return false
     if(isSpaceFeedPostPending(entry.postKey)) return false
+    if(isSettledSpaceFeedChase(entry)) return false
 
     return true
 }
@@ -9334,6 +9476,7 @@ function isQueueableSpaceFeedResolverEntryForRender(entry = null, context = null
     if(isSpaceFeedEntryNukedForRender(entry, context)) return false
     if(isSpaceFeedPostPendingForRender(entry.postKey, context)) return false
     if(isSpaceFeedResolverChaseQueued(entry)) return false
+    if(isSettledSpaceFeedChase(entry)) return false
 
     return true
 }
@@ -11247,6 +11390,8 @@ async function sendCoordinatorEnqueueChunked(payload = {}, onProgress = null) {
             break
         }
     }
+    // An enqueue can settle a candidate the page asked about before, so the next state refresh asks again (6 Nov).
+    spaceFeedChaseChecked = new Set()
 
     return {
         queued,
@@ -12303,6 +12448,7 @@ function ensureProfileSearchCollectionStateForCurrentSearch() {
 
     profileSearchCollectionKey = key
     profileSearchCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
+    profileSearchCollectSeconds = PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS
     resetProfileSearchCollectionState()
 }
 
@@ -12411,11 +12557,22 @@ function getProfileSearchCollectLimit() {
     return profileSearchCollectLimit
 }
 
-// Only a count the dropdown offers is taken. It applies to this search page only (see profileSearchCollectLimit).
+// Only a count or a time the dropdown offers is taken. It applies to this search page only (see profileSearchCollectLimit).
 function setProfileSearchCollectLimit(value) {
-    if(!PROFILE_SEARCH_COLLECT_CHOICES.includes(value)) return
-    profileSearchCollectLimit = value
+    const choice = parseCollectChoice(value, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_TIME_SECONDS)
+    if(!choice) return
+    if(choice.seconds) {
+        profileSearchCollectSeconds = choice.seconds
+    }
+    else {
+        profileSearchCollectLimit = choice.limit
+        profileSearchCollectSeconds = 0
+    }
     syncProfileSearchControls()
+}
+
+function currentProfileSearchCollectLabel() {
+    return collectChoiceLabel(profileSearchCollectSeconds ? {seconds: profileSearchCollectSeconds} : {limit: profileSearchCollectLimit})
 }
 
 function isProfileSearchFollowButton(button) {
@@ -12637,7 +12794,8 @@ function refreshProfileSearchStopLabel() {
         collected: profileSearchCollectProgress.collected,
         target: profileSearchCollectProgress.target,
         passes: profileSearchCollectProgress.passes,
-        elapsedMs: Date.now() - profileSearchCollectProgress.startedAt
+        elapsedMs: Date.now() - profileSearchCollectProgress.startedAt,
+        timeLimitMs: profileSearchCollectSeconds * 1000
     })
     if(stopButton.textContent !== label) stopButton.textContent = label
 }
@@ -12685,6 +12843,7 @@ function formatProfileSearchConsideredText(count) {
 // (no scan and no scroll) shows Page load instead of the recorded reason.
 const PROFILE_SEARCH_CAUSE_LABELS = {
     captured: 'Count reached',
+    'time-up': 'Time reached',
     'end-of-results': 'End of search results',
     'end-of-feed': 'End of search results',
     stalled: 'Stalled',
@@ -12742,6 +12901,12 @@ function createProfileSearchCollectLimitSelect() {
         const option = document.createElement('option')
         option.value = String(choice)
         option.textContent = String(choice)
+        select.appendChild(option)
+    }
+    for(const seconds of COLLECT_TIME_SECONDS) {
+        const option = document.createElement('option')
+        option.value = collectTimeValue(seconds)
+        option.textContent = formatMinutesSeconds(seconds)
         select.appendChild(option)
     }
     return select
@@ -12883,29 +13048,30 @@ function syncProfileSearchControls() {
         void collectMoreProfileSearchResults(event.currentTarget)
     })
     buttons.limit = ensureCurrentInstanceClickHandler(buttons.limit, 'profile-search-collect-limit', event => {
-        setProfileSearchCollectLimit(Number.parseInt(event.currentTarget.value, 10))
+        setProfileSearchCollectLimit(event.currentTarget.value)
         // Choosing a count only sets it; the collect starts from the Collect button (owner, 26 Oct).
     }, 'change')
     if(buttons.limit) {
-        if(buttons.limit.value !== String(limit)) buttons.limit.value = String(limit)
+        const searchSelectValue = profileSearchCollectSeconds ? collectTimeValue(profileSearchCollectSeconds) : String(getProfileSearchCollectLimit())
+        if(buttons.limit.value !== searchSelectValue) buttons.limit.value = searchSelectValue
         buttons.limit.disabled = profileSearchCollecting
     }
 
     if(profileSearchCollecting) {
-        setNukeButtonWorking(buttons.collect, buttons.collect.innerText || `Collecting 0 / ${limit}`)
+        setNukeButtonWorking(buttons.collect, buttons.collect.innerText || formatCollectingLabel({target: limit, timeSeconds: profileSearchCollectSeconds, startedAt: profileSearchCollectProgress.startedAt}))
         buttons.collect.disabled = false
         buttons.batch.disabled = !batchHrefs.length
     }
     else if(pendingSearchCount > 0) {
         // Collecting more does not wait for the nukes in progress, so the button is always offered (owner, 21 Oct).
-        setNukeButtonIdle(buttons.collect, `Collect ${limit} More`)
+        setNukeButtonIdle(buttons.collect, currentProfileSearchCollectLabel())
         buttons.collect.disabled = false
         buttons.batch.disabled = !batchHrefs.length
         scheduleProfileSearchPendingRefresh()
     }
     else {
         clearProfileSearchPendingRefresh()
-        setNukeButtonIdle(buttons.collect, `Collect ${limit} More`)
+        setNukeButtonIdle(buttons.collect, currentProfileSearchCollectLabel())
         buttons.collect.disabled = false
         buttons.batch.disabled = !batchHrefs.length
     }
@@ -12985,7 +13151,8 @@ async function nukeProfileSearchHrefsOnce(button, hrefs = [], options = {}) {
         marks: profileSearchEnqueueMarks,
         beforePress: () => syncProfileSearchControls(),
         pressButton: () => animateNukeButtonPress(button),
-        setWorking: text => setNukeButtonWorking(button, text),
+        // The batch button keeps its Nuke 'Em words while the batch queues: the toolbar status ("Queueing... N") carries the count (7 Nov).
+        setWorking: () => {},
         // Each chunk settles as its own message, so the remaining count drops chunk by chunk, as on the space page.
         sendBatch: (profileHrefs, onProgress) => enqueueCoordinatorProfileUrls({
             urls: profileHrefs,
@@ -13036,7 +13203,8 @@ async function refreshProfileSearchStateAfterEnqueue(profileHrefs = []) {
 }
 
 async function collectMoreProfileSearchResults(button) {
-    const limit = getProfileSearchCollectLimit()
+    // A time choice has no count limit: the run stops on the clock instead (7 Nov).
+    const limit = profileSearchCollectSeconds ? Number.POSITIVE_INFINITY : getProfileSearchCollectLimit()
     if(profileSearchCollecting) {
         profileSearchCollectStopRequested = true
         setNukeButtonWorking(button, 'Stopping...')
@@ -13047,7 +13215,7 @@ async function collectMoreProfileSearchResults(button) {
     // Each run starts with its own stop flag cleared, so a stop from an earlier run cannot end this one.
     profileSearchCollecting = true
     profileSearchCollectStopRequested = false
-    profileSearchCollectProgress = {startedAt: Date.now(), passes: 0, collected: 0, target: limit}
+    profileSearchCollectProgress = {startedAt: Date.now(), passes: 0, collected: 0, target: getProfileSearchCollectLimit()}
     // A new run clears the Considered line from the last run (owner, 27 Oct).
     setProfileSearchConsideredText('')
     // The distinct result row elements this run has read, over all its passes (owner, 27 Oct: rows, not unique profiles).
@@ -13070,7 +13238,7 @@ async function collectMoreProfileSearchResults(button) {
         // the pass, so the page is checked at the end before the nudge and the wait, as before. Stall: COLLECT_STALLED_TIMEOUT_MS at any position.
         const outcome = await runCollectLoop({
             isStopRequested: () => profileSearchCollectStopRequested,
-            isDone: () => collectedCount >= limit,
+            isDone: () => collectedCount >= limit || isCollectTimeUp(profileSearchCollectProgress.startedAt, profileSearchCollectSeconds),
             snapshot: () => ({count: collectedCount, scrollY: getProfileSearchScrollY(), scrollHeight: getProfileSearchScrollHeight()}),
             pass: () => {
                 const rows = getProfileSearchRows({fromCurrentViewport: true, skipProcessed: true})
@@ -13085,7 +13253,7 @@ async function collectMoreProfileSearchResults(button) {
                 // A pass counts once its read has run, so the label's count and passes always describe the same reads.
                 profileSearchCollectProgress.collected = collectedCount
                 profileSearchCollectProgress.passes += 1
-                setNukeButtonWorking(button, `Collecting ${getProfileSearchStagedHrefs().length} / ${targetStagedCount}`)
+                setNukeButtonWorking(button, formatCollectingLabel({staged: getProfileSearchStagedHrefs().length, target: targetStagedCount, timeSeconds: profileSearchCollectSeconds, startedAt: profileSearchCollectProgress.startedAt}))
                 syncProfileSearchControls()
 
                 if(collectedCount >= limit) return 'done'
@@ -13103,7 +13271,7 @@ async function collectMoreProfileSearchResults(button) {
         })
         endReached = outcome === 'end'
 
-        const endReason = profileSearchCollectStopRequested ? 'stopped' : collectedCount >= limit ? 'captured' : endReached ? 'end-of-results' : 'stalled'
+        const endReason = profileSearchCollectStopRequested ? 'stopped' : collectedCount >= limit ? 'captured' : isCollectTimeUp(profileSearchCollectProgress.startedAt, profileSearchCollectSeconds) ? 'time-up' : endReached ? 'end-of-results' : 'stalled'
         reportCollectEnd('search', {
             reason: endReason,
             collected: collectedCount,
@@ -13119,16 +13287,16 @@ async function collectMoreProfileSearchResults(button) {
         if(profileSearchCollectStopRequested) {
             // Owner: a stopped collect takes the page back to the top. The collected results stay.
             window.scrollTo({top: 0, behavior: 'auto'})
-            setNukeButtonNotice(button, 'Stopped', `Collect ${limit} More`)
+            setNukeButtonNotice(button, 'Stopped', currentProfileSearchCollectLabel())
             return false
         }
 
         if(collectedCount < 1) {
-            setNukeButtonNotice(button, 'No new candidates', `Collect ${limit} More`)
+            setNukeButtonNotice(button, 'No new candidates', currentProfileSearchCollectLabel())
             return false
         }
 
-        setNukeButtonNotice(button, endReached ? `Collected ${collectedCount} · end of search results` : `Collected ${collectedCount}`, `Collect ${limit} More`)
+        setNukeButtonNotice(button, endReached ? `Collected ${collectedCount} · end of search results` : `Collected ${collectedCount}`, currentProfileSearchCollectLabel())
         return true
     }
     finally {
@@ -13195,8 +13363,10 @@ function injectModalOpenProfilesBtn() {
         }
         else if(nukeBtn.dataset.mbNukeState !== 'working') {
             // 1 Nov (owner): the popup's Nuke 'Em shows the number of candidates, unique profiles, as the toolbar does.
-            setNukeButtonIdle(nukeBtn, `Nuke 'Em ${getModalQueueableUrls(modal, nukeItems).length}`)
-            nukeBtn.disabled = false
+            // At 0 there is nothing to queue, so Nuke 'Em is disabled and greyed like the other Nuke 'Em 0 buttons (7 Nov).
+            const modalQueueable = getModalQueueableUrls(modal, nukeItems).length
+            setNukeButtonIdle(nukeBtn, `Nuke 'Em ${modalQueueable}`)
+            nukeBtn.disabled = modalQueueable < 1
         }
         setMuteBlockHelp(nukeBtn, buildNukeTargetsHelpText('Queue listed profiles from this modal for mute and block', getModalProfileLinks(nukeItems)))
     }
@@ -13230,7 +13400,7 @@ function injectModalOpenProfilesBtn() {
         // A stop reason ("Stopped", "Collected N · end of list") stays until the next collect starts, as on the space page (4 Nov). The
         // status class marks a notice (setNukeButtonNotice) and a working collect, so the idle label is not drawn over either.
         if(!modalCollecting && collectBtn.dataset.mbNukeState !== 'working') {
-            setNukeButtonIdle(collectBtn, `Collect ${spaceFeedCollectLimit} More`)
+            setNukeButtonIdle(collectBtn, currentSpaceFeedCollectLabel())
         }
         collectBtn.disabled = false
         setMuteBlockHelp(collectBtn, modalCollecting
@@ -13241,11 +13411,12 @@ function injectModalOpenProfilesBtn() {
     if(collectSelect) {
         ensureCurrentInstanceClickHandler(collectSelect, 'modal-collect-limit', event => {
             // The count is the one saved for the space, so the space page's button and this one show the same number (1 Nov).
-            setSpaceFeedCollectLimit(Number.parseInt(event.currentTarget.value, 10))
+            setSpaceFeedCollectLimit(event.currentTarget.value)
             const popupBtn = event.currentTarget.closest('.mb-ext_modal-collect-wrap')?.querySelector('.mb-ext_modal-collect-btn')
-            if(popupBtn && !modalCollecting) setNukeButtonIdle(popupBtn, `Collect ${spaceFeedCollectLimit} More`)
+            if(popupBtn && !modalCollecting) setNukeButtonIdle(popupBtn, currentSpaceFeedCollectLabel())
         }, 'change')
-        if(collectSelect.value !== String(spaceFeedCollectLimit)) collectSelect.value = String(spaceFeedCollectLimit)
+        const popupSelectValue = spaceFeedCollectSeconds ? collectTimeValue(spaceFeedCollectSeconds) : String(spaceFeedCollectLimit)
+        if(collectSelect.value !== popupSelectValue) collectSelect.value = popupSelectValue
         collectSelect.disabled = false
     }
 }
@@ -13279,7 +13450,7 @@ async function collectMoreProfileModal(button) {
     const progress = {startedAt: Date.now(), passes: 0, collected: 0}
     const scroller = () => getProfileModalScrollContainer(modal)
     const atModalBottom = () => { const el = scroller(); return !el || el.scrollTop + el.clientHeight >= el.scrollHeight - 4 }
-    const label = () => formatCollectStopLabel({collected: progress.collected, target: spaceFeedCollectLimit, passes: progress.passes, elapsedMs: Date.now() - progress.startedAt})
+    const label = () => formatCollectStopLabel({collected: progress.collected, target: spaceFeedCollectLimit, passes: progress.passes, elapsedMs: Date.now() - progress.startedAt, timeLimitMs: spaceFeedCollectSeconds * 1000})
     modalCollecting = true
     modalCollectStopRequested = false
     applyCollectNukeGate(modal.querySelector('.mb-ext_nuke-profiles-btn'), true)
@@ -13291,7 +13462,7 @@ async function collectMoreProfileModal(button) {
         const adaptiveWait = createAdaptiveCollectWait({floorMs: MODAL_PROFILE_NUKE_SCROLL_WAIT_MS, ceilingMs: COLLECT_ADAPTIVE_WAIT_MAX_MS})
         const outcome = await runCollectLoop({
             isStopRequested: () => modalCollectStopRequested,
-            isDone: () => progress.collected >= spaceFeedCollectLimit,
+            isDone: () => (!spaceFeedCollectSeconds && progress.collected >= spaceFeedCollectLimit) || isCollectTimeUp(progress.startedAt, spaceFeedCollectSeconds),
             snapshot: () => ({count: getProfileModalItems(modal).length, scrollY: scroller()?.scrollTop || 0, scrollHeight: scroller()?.scrollHeight || 0}),
             pass: () => {
                 const el = scroller()

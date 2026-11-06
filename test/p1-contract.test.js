@@ -3309,6 +3309,7 @@ test('profile search buttons keep live commands dark and disabled commands grey'
     assert.match(css, /\.mb-ext_nuke-profiles-btn\s*\{[\s\S]*background-color:\s*#111/)
     assert.match(css, /\.mb-ext_profile-search-toolbar \.mb-ext_nuke-profiles-btn,\s*\n\.mb-ext_profile-search-action-host \.mb-ext_nuke-profiles-btn\s*\{[\s\S]*background-color:\s*#111[\s\S]*color:\s*#fff[\s\S]*border:\s*1px solid #111[\s\S]*border-radius:\s*999px/)
     assert.match(css, /\.mb-ext_profile-search-toolbar \.mb-ext_nuke-profiles-btn:not\(:disabled\):hover,\s*\n\.mb-ext_profile-search-action-host \.mb-ext_nuke-profiles-btn:not\(:disabled\):hover\s*\{[\s\S]*background-color:\s*#000[\s\S]*color:\s*#fff/)
+    // Every disabled Nuke 'Em button goes grey, including the search page's batch button at 0 (6 Nov).
     assert.match(css, /\.mb-ext_profile-search-toolbar \.mb-ext_nuke-profiles-btn:disabled,\s*\n\.mb-ext_profile-search-action-host \.mb-ext_nuke-profiles-btn:disabled\s*\{[\s\S]*background-color:\s*#f3f4f6[\s\S]*color:\s*#7b8494/)
     assert.match(css, /\.mb-ext_profile-search-toolbar \.mb-ext_nuke-profiles-btn--working,[\s\S]*background-color:\s*#fff7ed[\s\S]*color:\s*#7c2d12/)
     assert.match(css, /\.mb-ext_profile-search-toolbar \.mb-ext_nuke-profiles-btn--done,[\s\S]*background-color:\s*#eefdf3[\s\S]*color:\s*#166534/)
@@ -3405,7 +3406,7 @@ test('profile search collector stages a bounded batch without queueing', () => {
     assert.match(collectBody, /nudgeProfileSearchLazyLoad\(\)/)
     assert.match(collectBody, /stageProfileSearchHrefs\(\[row\.href\]\)/)
     assert.match(collectBody, /saveProfileSearchCollectCursor\(rows\)/)
-    assert.match(collectBody, /Collecting \$\{getProfileSearchStagedHrefs\(\)\.length\} \/ \$\{targetStagedCount\}/)
+    assert.match(collectBody, /formatCollectingLabel\(\{staged: getProfileSearchStagedHrefs\(\)\.length, target: targetStagedCount, timeSeconds: profileSearchCollectSeconds/)
     assert.match(collectBody, /isProfileSearchEndOfResultsVisible\(\) && !hasUnstagedProfileSearchQueueableRow\(\) && !hasProfileSearchLoadingIndicator\(\)/)
     assert.match(collectBody, /nudgeProfileSearchLazyLoad\(\)/)
     assert.match(collectBody, /stallTimeoutMs: COLLECT_STALLED_TIMEOUT_MS/)
@@ -3431,7 +3432,7 @@ test('profile search collector stages a bounded batch without queueing', () => {
     assert.match(pendingCountBody, /const currentSearchItems = Object\.values\(coordinatorQueue \|\| \{\}\)/)
     assert.match(pendingCountBody, /filter\(isCoordinatorItemForCurrentProfileSearch\)/)
     assert.match(pendingCountBody, /if\(currentSearchItems\.length > 0\) return 0/)
-    assert.match(syncBody, /Collect \$\{limit\} More/)
+    assert.match(syncBody, /currentProfileSearchCollectLabel\(\)/, 'the search button label comes from the current choice, count or time')
     assert.match(syncBody, /'profile-search-batch'[\s\S]*nukeProfileSearchHrefs\(activeButton, hrefs/)
     assert.match(syncBody, /if\(queued\) resetProfileSearchCollectionState\(\{keepCursor: true\}\)/)
     assert.doesNotMatch(syncBody, /if\(profileSearchCollecting\) return/)
@@ -5128,8 +5129,8 @@ test('the Stop collecting label on both pages comes from the shared candidateCol
     assert.match(searchSync, /clearInterval\(profileSearchStopLabelTimer\)/)
     assert.match(readRepoFile('shared/js/tunables.js'), /COLLECT_STOP_LABEL_TICK_MS: 1000/)
     // Each run starts its counters, and the start of the run goes to the shared sync before the loop runs.
-    assert.match(extractFunction(source, 'async function collectMoreSpaceFeedPosts(button)'), /spaceFeedCollectProgress = \{startedAt: Date\.now\(\), passes: 0, collected: 0, target: limit\}\s*syncSpaceFeedStopButtons\(\)/)
-    assert.match(extractFunction(source, 'async function collectMoreProfileSearchResults(button)'), /profileSearchCollectProgress = \{startedAt: Date\.now\(\), passes: 0, collected: 0, target: limit\}[\s\S]*?syncProfileSearchStopButton\(\)/)
+    assert.match(extractFunction(source, 'async function collectMoreSpaceFeedPosts(button)'), /spaceFeedCollectProgress = \{startedAt: Date\.now\(\), passes: 0, collected: 0, target: spaceFeedCollectLimit\}\s*syncSpaceFeedStopButtons\(\)/)
+    assert.match(extractFunction(source, 'async function collectMoreProfileSearchResults(button)'), /profileSearchCollectProgress = \{startedAt: Date\.now\(\), passes: 0, collected: 0, target: getProfileSearchCollectLimit\(\)\}[\s\S]*?syncProfileSearchStopButton\(\)/)
 })
 
 test('choosing a collect count only sets it; the collect starts from the Collect button, on both pages', () => {
@@ -5137,8 +5138,9 @@ test('choosing a collect count only sets it; the collect starts from the Collect
     const spaceBody = extractFunction(source, 'function syncSpaceFeedCollectButton(options = {})')
     const searchBody = extractFunction(source, 'function syncProfileSearchControls()')
 
-    assert.match(spaceBody, /setSpaceFeedCollectLimit\(Number\.parseInt\(event\.currentTarget\.value, 10\)\)/)
-    assert.match(searchBody, /setProfileSearchCollectLimit\(Number\.parseInt\(event\.currentTarget\.value, 10\)\)/)
+    // The raw value goes in: a time option is "time:300", which Number.parseInt would turn into NaN (6 Nov).
+    assert.match(spaceBody, /setSpaceFeedCollectLimit\(event\.currentTarget\.value\)/)
+    assert.match(searchBody, /setProfileSearchCollectLimit\(event\.currentTarget\.value\)/)
     assert.doesNotMatch(spaceBody, /void collectMoreSpaceFeedPosts\(collectButton\)/)
     assert.doesNotMatch(searchBody, /void collectMoreProfileSearchResults\(collectButton\)/)
 })
@@ -6960,6 +6962,15 @@ test('history remove duplicates keeps only the newest row per profile when on, a
     assert.doesNotMatch(source, /sortHistoryRows|historyDedupeRows|HISTORY_STATUS_ORDER/, 'the page no longer sorts the history rows')
 })
 
+test('a banned or deactivated profile is a success on History; a failed row is still an error (owner, 7 Nov)', () => {
+    const evaluate = loadDashboardHarness()
+    const skipped = outcome => ({status: 'skipped', outcome, error: 'Profile banned'})
+    assert.equal(evaluate(`historyRowHasError(${JSON.stringify(skipped('banned'))})`), false, 'banned is a success')
+    assert.equal(evaluate(`historyRowHasError(${JSON.stringify(skipped('deactivated'))})`), false, 'deactivated is a success')
+    assert.equal(evaluate(`historyRowHasError(${JSON.stringify({status: 'failed', outcome: 'profile-unavailable', error: 'boom'})})`), true, 'a failed row is still an error')
+    assert.equal(evaluate(`historyRowHasError(${JSON.stringify(skipped('profile-unavailable'))})`), true, 'another skipped row with an error text is still an error')
+})
+
 test('history page has a filter box, a remove-duplicates checkbox and a count, beside the sort control, and render keeps the count current', () => {
     const pageHtml = readRepoFile('shared/coordinator.html')
     const controlsAt = pageHtml.indexOf('class="history-controls"')
@@ -7051,6 +7062,16 @@ test('a merged resolve row is reported under its chase key, chases compare in on
     assert.match(extractFunction(content, 'function isSpaceFeedResolverChaseQueued(entry = null) {'), /normalizeSpaceFeedChaseUrl\(entry\?\.resolutionUrl\)/, 'the chase check compares normalised addresses')
     const queueRuntime = readRepoFile('shared/js/swqueueRuntime.js')
     assert.match(queueRuntime, /priorityDiff = \(isResolveQueueRow\(leftItem\) \? 0 : 1\)/, 'the queue order puts resolve rows first')
+})
+
+test('the worker closes and adopts only tabs it opened; a tab the user has on the same address is left alone (owner, 7 Nov)', () => {
+    const reclaim = readRepoFile('shared/js/swQueuedTabReclaimResume.js')
+    const selectBody = extractFunction(reclaim, 'function selectQueuedWorkerReclaimTab(candidates = [], reason = \'queued-worker-reclaim\')')
+    assert.match(selectBody, /\.filter\(tab => normalizeTabId\(tab\?\.id\) && isQueueOwnedTab\(tab\)\)/, 'only worker-opened tabs are candidates, so only they can be closed as duplicates')
+    const sw = readRepoFile('shared/js/sw.js')
+    const candidateBody = extractFunction(sw, 'async function getWorkerSurfaceLiveTabForQueuedCoordinatorItem(item = null, itemKey = \'\', liveProfileTabsByHref = new Map(), record = null)')
+    assert.match(candidateBody, /isOwnedWorkerSurfaceTab\(tab\)/, 'the item\'s candidate tabs are only the worker-opened ones')
+    assert.doesNotMatch(candidateBody, /!hasOwnedQueuedTabState\(tab\.id\)/, 'a tab without owned state is not adopted just for lacking it')
 })
 
 test('the space categories share one set of colour tokens, and the Quora page and the preferences page both use them (owner, 6 Nov)', () => {
@@ -7299,11 +7320,16 @@ function loadSpaceCollectCountHarness(options) {
     }
     const context = vm.createContext({
         PROFILE_SEARCH_COLLECT_LIMIT: tunables.PROFILE_SEARCH_COLLECT_LIMIT,
+        PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS: tunables.PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS,
         PROFILE_SEARCH_COLLECT_CHOICES: tunables.PROFILE_SEARCH_COLLECT_CHOICES,
         normalizeSpaceUrl: registryModule.normalizeSpaceUrl,
         extractSpaceSlug: registryModule.extractSpaceSlug,
         normalizeSpaceCollectCount: registryModule.normalizeSpaceCollectCount,
         withSpaceRecordCollectCount: registryModule.withSpaceRecordCollectCount,
+        normalizeSpaceCollectSeconds: registryModule.normalizeSpaceCollectSeconds,
+        withSpaceRecordCollectSeconds: registryModule.withSpaceRecordCollectSeconds,
+        parseCollectChoice: require('../shared/js/candidateCollect').parseCollectChoice,
+        COLLECT_TIME_SECONDS: [5, 10, 30, 60, 120, 300],
         location: state.location,
         resolveCurrentSpaceDescriptor: () => state.descriptor,
         syncSpaceFeedCollectButton: () => { state.syncs += 1 },
@@ -7316,6 +7342,7 @@ function loadSpaceCollectCountHarness(options) {
     })
     vm.runInContext([
         'let spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT',
+        'let spaceFeedCollectSeconds = 0',
         "let spaceFeedCollectKey = ''",
         'let spaceFeedCollecting = false',
         'let spaceRegistry = {}',
@@ -7352,6 +7379,7 @@ test('a space page starts with the collect count on its registry record, and the
     h.state.descriptor = {key: 'quora-space:https://www.quora.com/space/B', url: 'https://www.quora.com/space/B', slug: 'B', name: 'B'}
     h.run('ensureSpaceFeedCollectStateForCurrentSpace()')
     assert.equal(h.run('spaceFeedCollectLimit'), 100)
+    assert.equal(h.run('spaceFeedCollectSeconds'), 10, 'a space with no record starts on Collect for 00:10 (7 Nov)')
 })
 
 test('choosing a count on a categorised space writes it into that space record, and an unchanged count writes nothing (27 Oct)', () => {
@@ -7420,7 +7448,7 @@ test('the search batch counts its queueing down per chunk, as the space page doe
     assert.match(searchBlock, /sendBatch: \(profileHrefs, onProgress\) => enqueueCoordinatorProfileUrls\(\{/)
     assert.match(searchBlock, /onProgress\n\s*\}\)/)
     // The progress label is written by the shared driver that both pages use (candidateNuke.js), not by the page.
-    assert.match(readRepoFile('shared/js/candidateNuke.js'), /setWorking\(formatQueueingLabel\(remaining, totalItems\)\)/)
+    assert.match(readRepoFile('shared/js/candidateNuke.js'), /setWorking\(formatQueueingLabel\(remaining\)\)/)
     assert.doesNotMatch(searchBlock, /Queueing \$\{profileHrefs\.length\}\.\.\./)
 })
 
@@ -7545,4 +7573,141 @@ test('MB Info shows only on asset and target spaces; a space with no stored cate
     const body = extractFunction(readRepoFile('shared/js/content.js'), 'function syncSpaceFeedStatusButton(entries = null)')
     assert.match(body, /if\(category !== 'asset' && category !== 'target'\) \{/)
     assert.match(body, /host\.querySelector\('\.mb-ext_space-feed-status-btn'\)\?\.remove\(\)/)
+})
+
+test('every logo links to the Mute Block site, and the bottom bar no longer uses its logo as a dashboard button', () => {
+    const {MUTE_BLOCK_SITE_URL} = require('../shared/js/muteBlockSite.js')
+    assert.equal(MUTE_BLOCK_SITE_URL, 'https://muteblock.quora.com')
+
+    // The shared progress bar builds the logo for the Quora page, the dashboard and History footers, and the #progress page.
+    const bar = readRepoFile('shared/js/queueProgressBar.js')
+    assert.match(bar, /logoLink\.href = MUTE_BLOCK_SITE_URL/)
+    assert.match(bar, /logoLink\.target = '_blank'/)
+    assert.doesNotMatch(bar, /onLogoClick/)
+
+    // The two HTML headers carry the same address in their markup, since an HTML page cannot import the constant.
+    const siteUrl = MUTE_BLOCK_SITE_URL.replace(/[.\/]/g, '\$&')
+    assert.match(readRepoFile('shared/coordinator.html'), new RegExp(`<a class="brand-mark-link" href="${siteUrl}"[^>]*><img class="brand-mark"`))
+    assert.match(readRepoFile('shared/preferences.html'), new RegExp(`<a class="header-logo-link" href="${siteUrl}"[^>]*><img class="header-logo"`))
+
+    for (const file of ['shared/js/coordinator.js', 'shared/js/preferences.js', 'shared/js/queueBottomBar.js']) {
+        assert.doesNotMatch(readRepoFile(file), /onLogoClick|openDashboardFromBottomBar/, `${file} no longer wires a logo click`)
+    }
+})
+
+test('a space page drops a pending row of its posts only when the reply covers them, and the worker returns every live row of those posts (6 Nov)', () => {
+    // The two rows that stayed after a nuke were unresolved posts: no profile, so the profile-keyed drop never reached them.
+    const content = readRepoFile('shared/js/content.js')
+    const sw = readRepoFile('shared/js/sw.js')
+
+    // Page side: the request names the pending posts, and the drop runs only when the reply says postKeysCovered.
+    assert.match(content, /postKeys: page === 'space' \? getPendingCoordinatorPostKeys\(\) : \[\]/)
+    assert.match(content, /result\.postKeysCovered === true\s*\?\s*dropPendingCoordinatorRowsForPostKeys\(queueAfterProfileDrop, request\.postKeys, result\.coordinatorQueue\)/)
+
+    const dropPending = extractFunction(content, 'function dropPendingCoordinatorRowsForPostKeys(')
+    const getPending = extractFunction(content, 'function getPendingCoordinatorPostKeys(')
+    const isPending = extractFunction(content, 'function isPendingCoordinatorStatus(')
+    const context = vm.createContext({
+        PENDING_COORDINATOR_STATUSES: new Set(['queued', 'opening', 'active', 'acting', 'settling']),
+        coordinatorQueue: {}
+    })
+    vm.runInContext([isPending, getPending, dropPending].join('\n'), context)
+    const run = code => vm.runInContext(code, context)
+    context.queue = {
+        'unresolved-done': {status: 'succeeded', evidence: [{postKey: 'space-post:A'}]},
+        'unresolved-live': {status: 'queued', evidence: [{postKey: 'space-post:B'}]},
+        'unresolved-gone': {status: 'queued', evidence: [{postKey: 'space-post:C'}]},
+        'profile-row': {status: 'active', targetProfileHref: 'https://www.quora.com/profile/X', evidence: [{postKey: 'space-post:D'}]}
+    }
+    context.coordinatorQueue = context.queue
+    assert.deepEqual([...run('getPendingCoordinatorPostKeys().sort()')], ['space-post:B', 'space-post:C', 'space-post:D'])
+    const reply = {'unresolved-live': {status: 'queued'}}
+    const kept = run(`dropPendingCoordinatorRowsForPostKeys(queue, ['space-post:B', 'space-post:C'], ${JSON.stringify(reply)})`)
+    assert.ok(kept['unresolved-live'], 'a row the reply returns is kept')
+    assert.equal(kept['unresolved-gone'], undefined, 'a pending row of an asked post the reply lacks is dropped')
+    assert.ok(kept['unresolved-done'], 'a finished row is not a pending row, so it is left alone')
+    assert.ok(kept['profile-row'], 'a pending row of a post that was not asked is left alone')
+
+    // Worker side: the reply carries every live row of the named posts, and says it did.
+    const addLive = extractFunction(sw, 'function addLiveCoordinatorRowsForPostKeys(')
+    const liveQueue = {
+        'live-A': {status: 'queued', evidence: [{postKey: 'space-post:B'}]},
+        'done-B': {status: 'succeeded', evidence: [{postKey: 'space-post:B'}]},
+        'other': {status: 'active', evidence: [{postKey: 'space-post:Z'}]}
+    }
+    const workerContext = vm.createContext({
+        getHydratedCoordinatorAuthorityState: () => ({queue: liveQueue}),
+        shouldIncludeCoordinatorItemInContentQueueIndex: item => !['succeeded', 'failed'].includes(item.status),
+        summarizeCoordinatorContentQueueItem: (key, item) => ({key, status: item.status})
+    })
+    vm.runInContext(addLive, workerContext)
+    workerContext.scopedAfter = {}
+    assert.equal(vm.runInContext('addLiveCoordinatorRowsForPostKeys(scopedAfter, ["space-post:B"])', workerContext), true)
+    assert.deepEqual(Object.keys(workerContext.scopedAfter), ['live-A'], 'only the live row of the named post comes back')
+    assert.equal(vm.runInContext('addLiveCoordinatorRowsForPostKeys({}, [])', workerContext), false, 'no post keys, nothing is covered')
+    workerContext.getHydratedCoordinatorAuthorityState = () => null
+    assert.equal(vm.runInContext('addLiveCoordinatorRowsForPostKeys({}, ["space-post:B"])', workerContext), false, 'an unhydrated queue covers nothing, so the page drops nothing')
+    assert.match(sw, /const postKeysCovered = addLiveCoordinatorRowsForPostKeys\(scopedQueue, request\.postKeys\)/)
+    assert.match(sw, /coordinatorQueue: scopedQueue,\n        postKeysCovered,/)
+})
+
+test('a resolver candidate whose completed row settles it is not offered again, and the worker names those chase URLs (6 Nov)', async () => {
+    const content = readRepoFile('shared/js/content.js')
+    const sw = readRepoFile('shared/js/sw.js')
+
+    // Page side: the request sends the chase URLs, the reply's settled list replaces the page's set, and both queueable filters skip them.
+    assert.match(content, /chaseUrls: page === 'space' \? getSpaceFeedResolverChaseUrls\(\) : \[\]/)
+    assert.match(content, /if\(Array\.isArray\(result\.settledChaseUrls\)\) \{/)
+    assert.match(extractFunction(content, 'function isQueueableSpaceFeedResolverEntry('), /isSettledSpaceFeedChase\(entry\)/)
+    assert.match(extractFunction(content, 'function isQueueableSpaceFeedResolverEntryForRender('), /isSettledSpaceFeedChase\(entry\)/)
+
+    // Worker side: a settled chase is a completed row that is not a retryable failure; the list echoes the URLs as they were sent.
+    const findSettled = extractFunction(sw, 'async function findSettledCoordinatorChaseUrls(')
+    const rows = {
+        'resolve-profile:https://www.quora.com/Done-question/log': {status: 'succeeded'},
+        'resolve-profile:https://www.quora.com/Failed-question/log': {status: 'failed', outcome: 'retryable-failure'}
+    }
+    const context = vm.createContext({
+        makeProfileResolutionQueueKey: url => `resolve-profile:${url}`,
+        normalizeCoordinatorRequestedUrl: url => url,
+        isRetryableCoordinatorFailure: row => row.status === 'failed',
+        coordinatorQueueReader: {completedRow: async key => rows[key] || null}
+    })
+    vm.runInContext(findSettled, context)
+    const settled = await vm.runInContext(`findSettledCoordinatorChaseUrls(['https://www.quora.com/Done-question/log', 'https://www.quora.com/Failed-question/log', 'https://www.quora.com/Unknown/log'])`, context)
+    assert.deepEqual([...settled], ['https://www.quora.com/Done-question/log'], 'a finished resolver is settled; a retryable failure and an unknown one are not')
+    assert.match(sw, /const settledChaseUrls = await findSettledCoordinatorChaseUrls\(request\.chaseUrls\)/)
+    assert.match(sw, /postKeysCovered,\n        settledChaseUrls,/)
+})
+
+test('a bad-link reason reads banned, deactivated, inactivated or deleted whatever else the record says, and the chase URLs are asked once (6 Nov)', () => {
+    const content = readRepoFile('shared/js/content.js')
+
+    const detail = extractFunction(content, 'function getSpaceFeedBadLinkDetail(')
+    const context = vm.createContext({normalizeQuoraProfileHref: value => (`${value || ''}`.startsWith('https://www.quora.com/profile/') ? `${value}` : '')})
+    vm.runInContext(detail, context)
+    const reasonOf = record => vm.runInContext(`getSpaceFeedBadLinkDetail('https://www.quora.com/profile/Someone', ${JSON.stringify(record)}).reason`, context)
+    assert.equal(reasonOf({unavailableReason: 'profile-redirect-mismatch', status: 'banned'}), 'banned', 'a mismatch record that says banned reads banned')
+    assert.equal(reasonOf({unavailableReason: 'profile-redirect-mismatch', finalError: 'Profile deactivated'}), 'deactivated')
+    assert.equal(reasonOf({unavailableReason: 'Profile banned'}), 'Profile banned', 'a recorded banned reason keeps its wording')
+    assert.equal(reasonOf({unavailableReason: 'profile-redirect-mismatch'}), 'profile-redirect-mismatch', 'a mismatch with no such word keeps its own reason')
+
+    // Chase URLs: each is asked once per page load, a settled one is never asked again, and an enqueue clears the checked set.
+    assert.match(content, /let spaceFeedChaseChecked = new Set\(\)/)
+    const chase = extractFunction(content, 'function getSpaceFeedResolverChaseUrls(')
+    const chaseContext = vm.createContext({
+        settledSpaceFeedChaseUrls: new Set(['https://www.quora.com/Settled/log']),
+        spaceFeedChaseChecked: new Set(),
+        getDiscoveredSpaceFeedEntries: () => [
+            {resolutionUrl: 'https://www.quora.com/Settled/log', resolveProfileFromPage: true},
+            {resolutionUrl: 'https://www.quora.com/New/log', resolveProfileFromPage: true},
+            {resolutionUrl: 'https://www.quora.com/Not-a-resolver/log', resolveProfileFromPage: false}
+        ]
+    })
+    vm.runInContext(chase, chaseContext)
+    assert.deepEqual([...vm.runInContext('getSpaceFeedResolverChaseUrls()', chaseContext)], ['https://www.quora.com/New/log'])
+    chaseContext.spaceFeedChaseChecked.add('https://www.quora.com/New/log')
+    assert.deepEqual([...vm.runInContext('getSpaceFeedResolverChaseUrls()', chaseContext)], [], 'a URL already asked is not sent again')
+    assert.match(content, /spaceFeedChaseChecked = new Set\(\)\n/, 'an enqueue clears the checked set')
+    assert.match(content, /for\(const url of Array\.isArray\(request\.chaseUrls\) \? request\.chaseUrls : \[\]\) spaceFeedChaseChecked\.add\(url\)/)
 })

@@ -17,10 +17,11 @@ function countOf(value) {
     return Math.max(0, Math.floor(Number(value) || 0))
 }
 
-// The batch button while the enqueue is in flight: "Queueing..." or "Queueing... R of T", R being what is still to queue of the T items.
-function formatQueueingLabel(remaining = 0, totalItems = 0) {
+// The batch button while the enqueue is in flight: "Queueing N..." counts down as chunks settle, N being what is still to queue (6 Nov).
+// With nothing left to count, it reads "Queueing...".
+function formatQueueingLabel(remaining = 0) {
     const left = countOf(remaining)
-    return left > 0 ? `Queueing... ${left} of ${countOf(totalItems)}` : 'Queueing...'
+    return left > 0 ? `Queueing ${left}...` : 'Queueing...'
 }
 
 // The queue's work for this page, with the count still to nuke when there is one. When the queue is paused the same label reads "Nuking Paused"
