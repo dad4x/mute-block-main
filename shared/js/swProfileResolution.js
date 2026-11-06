@@ -49,6 +49,8 @@
 // normalizeTabTargetUrl come from the already-required `./subject`
 // module and are threaded through the same way.
 
+const {normalizeQuoraQuestionHref} = require('./subject')
+
 function createProfileResolution(deps = {}) {
     const {
         MAX_PROFILE_NUKE_PROGRESS_ENTRIES,
@@ -135,7 +137,9 @@ function createProfileResolution(deps = {}) {
         try {
             const url = new URL(normalized)
             url.hash = ''
-            return url.toString()
+            // A question\'s chase address (ends in /log) takes the one question form, so the same question is one key (6 Nov).
+            const question = /\/log$/i.test(url.pathname) ? normalizeQuoraQuestionHref(url.toString()) : null
+            return question ? `${question}/log` : url.toString()
         }
         catch {
             return normalized

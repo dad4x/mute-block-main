@@ -88,6 +88,10 @@ module.exports = {
     // Dashboard: how often the Current Work line's session duration is redrawn while a work session runs. The line reads no storage between redraws.
     DASHBOARD_WORK_SESSION_REDRAW_MS: 1000,
     DASHBOARD_WORK_SESSION_REFRESH_MS: 5000,
+    // Dashboard: a polled refresh lists at most this many rows from the head of the queue. The initial load lists the whole queue. The counts always cover the whole queue (5 Nov).
+    DASHBOARD_QUEUE_POLL_HEAD_LIMIT: 10,
+    // History and Preferences pages: how often the bottom progress bar asks the worker for the queue-bar summary (counts only, not the queue) (6 Nov).
+    QUEUE_BAR_PAGE_POLL_MS: 2000,
     // Dashboard flight recorder card (dev mode only): how often it asks the worker for new events while it is expanded, and how many rows it keeps.
     FLIGHT_RECORDER_CARD_POLL_MS: 1000,
     FLIGHT_RECORDER_CARD_ROW_LIMIT: 200,

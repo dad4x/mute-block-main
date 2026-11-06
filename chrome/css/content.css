@@ -150,6 +150,12 @@
     opacity: 1;
 }
 
+/* A Nuke 'Em that a running collect holds (4 Nov): disabled and dimmed, so it reads as unavailable, not broken. */
+.mb-ext_nuke-profiles-btn[data-mb-collect-gated="true"] {
+    cursor: not-allowed;
+    opacity: 0.45;
+}
+
 /* 1 Nov (audit): a status display (Nuking, Nuked, a notice or error) is not a button, so it is a rectangle, disabled or not. A real button
    stays a pill. The state setters in content.js add this class. */
 .mb-ext_nuke-profiles-btn--status {
@@ -162,6 +168,25 @@
 
 .mb-ext_nuke-profiles-btn--flash {
     animation: mb-ext-nuke-double-flash 350ms ease-out;
+}
+
+/* Every extension button on a Quora page flashes once when pressed (6 Nov). Nuke 'Em keeps its own double flash. */
+.mb-button-press-flash {
+    animation: mb-button-press-flash var(--mb-button-press-flash-ms) ease-out;
+}
+
+@keyframes mb-button-press-flash {
+    0% {
+        filter: invert(0);
+    }
+
+    30% {
+        filter: invert(1);
+    }
+
+    100% {
+        filter: invert(0);
+    }
 }
 
 @keyframes mb-ext-nuke-double-flash {
@@ -297,6 +322,28 @@
    sizes to its content, so a longer running label moves the buttons to its left instead of overflowing the popup. */
 .mb-ext_modal-collect-wrap {
     margin-left: 8px;
+}
+
+/* The Collect result under the button, the same on the space page and the popup (5 Nov). It is a caption below the button, not a row in the toolbar (6 Nov). */
+.mb-ext_space-collect-wrap,
+.mb-ext_modal-collect-wrap {
+    align-items: center;
+    column-gap: 8px;
+    flex-wrap: wrap;
+    position: relative;
+}
+
+.mb-ext_collect-result {
+    color: #444;
+    /* Out of the flow: the caption sits under the button, so the toolbar buttons keep one vertical centre (6 Nov). */
+    margin-top: 2px;
+    position: absolute;
+    right: 0;
+    top: 100%;
+    font-size: 11px;
+    line-height: 1.2;
+    text-align: right;
+    white-space: nowrap;
 }
 
 [role="dialog"] .mb-ext_open-profiles-btn {
@@ -473,9 +520,14 @@
 
 /* The queue's status beside the Nuke 'Em button and the batch button (owner, 25 Oct): a display only, so it does not hold either button. */
 /* One rule for both batch toolbars (28 Oct): the space page and the search page use the same class (NUKING_TOOLBAR_STATUS_CLASS in content.js). */
+/* The toolbar status is a status box, not a pill (5 Nov): pause is in the progress bar, so there is no drop-down beside it. */
 .mb-ext_nuking-status {
-    font-size: 12px;
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
     color: #374151;
+    font-size: 12px;
+    padding: 2px 8px;
     white-space: nowrap;
     align-self: center;
 }
@@ -623,7 +675,7 @@
 }
 
 .mb-ext_space-category-btn--active[data-category="asset"] {
-    background: #176a43;
+    background: var(--mb-category-asset);
     box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.18), 0 6px 18px rgba(0, 0, 0, 0.24);
     color: #fff;
 }
@@ -635,7 +687,7 @@
 }
 
 .mb-ext_space-category-btn--active[data-category="target"] {
-    background: var(--mb-brand-red);
+    background: var(--mb-category-target);
     box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.18), 0 6px 18px rgba(0, 0, 0, 0.24);
     color: #fff;
 }

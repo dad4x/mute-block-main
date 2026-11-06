@@ -85,6 +85,8 @@ async function runBatchNuke({
             // The enqueue is durable, so the marks wait for a state reply asked from now on. They go once the worker has answered the refresh,
             // whatever it showed.
             marks.settle(batch, true)
+            // The worker says which candidates it merged into rows already queued. Those marks go now, with no page-side count (6 Nov).
+            marks.applyToStateReply(Date.now(), Array.isArray(result?.mergedKeys) ? result.mergedKeys : [], [])
             void refreshAfterEnqueue(work)
                 .catch(() => false)
                 .finally(() => {

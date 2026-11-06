@@ -278,18 +278,18 @@ body {
 }
 
 .space-item-category--asset {
-    background: var(--mb-brand-red-tint);
-    color: var(--mb-brand-red-darker);
+    background: var(--mb-category-asset-tint);
+    color: var(--mb-category-asset);
 }
 
 .space-item-category--neutral {
-    background: var(--mb-grey-200);
+    background: var(--mb-category-neutral-tint);
     color: var(--mb-grey-700);
 }
 
 .space-item-category--target {
-    background: var(--mb-grey-200);
-    color: var(--mb-grey-900);
+    background: var(--mb-category-target-tint);
+    color: var(--mb-category-target-text);
 }
 
 .popup-space-segmented {
@@ -321,15 +321,15 @@ body {
 }
 
 .popup-space-button--asset {
-    background: var(--mb-brand-red);
+    background: var(--mb-category-asset);
 }
 
 .popup-space-button--neutral {
-    background: var(--mb-grey-500);
+    background: var(--mb-category-neutral);
 }
 
 .popup-space-button--target {
-    background: var(--mb-grey-900);
+    background: var(--mb-category-target);
 }
 
 @media (min-width: 720px) {
@@ -431,5 +431,112 @@ body {
 @media (min-width: 1040px) {
     .form {
         grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+
+/* Every extension button on the preferences page flashes once when pressed (6 Nov). */
+.mb-button-press-flash {
+    animation: mb-button-press-flash var(--mb-button-press-flash-ms) ease-out;
+}
+
+@keyframes mb-button-press-flash {
+    0% {
+        filter: invert(0);
+    }
+
+    30% {
+        filter: invert(1);
+    }
+
+    100% {
+        filter: invert(0);
+    }
+}
+
+/* The standard pill, as on the dashboard and History (6 Nov): the header buttons, Save (black) and Reset (white), and the bottom bar's Pause. */
+.header-buttons {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.clear-button {
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 999px;
+    color: var(--mb-grey-700);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 7px 10px;
+}
+
+.clear-button:hover:not(:disabled) {
+    background: var(--mb-grey-50);
+}
+
+.clear-button:disabled {
+    cursor: default;
+    opacity: 0.5;
+}
+
+.clear-button.pause-toggle {
+    background: var(--mb-black);
+    border: 1px solid var(--mb-black);
+    border-radius: 999px;
+    color: var(--mb-white);
+}
+
+.clear-button.pause-toggle:hover:not(:disabled) {
+    background: var(--mb-grey-800);
+    border-color: var(--mb-grey-800);
+}
+
+/* The title, with the version as a subhead under it (6 Nov). */
+.header-main {
+    align-items: flex-start;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.header-subhead {
+    font-size: 12px;
+    opacity: 0.85;
+}
+
+/* The header brand (logo, title and version), the Quora return and the buttons (6 Nov), as on the dashboard. */
+.header-brand {
+    align-items: center;
+    display: flex;
+    gap: 10px;
+}
+
+.header-logo {
+    height: 32px;
+    width: 32px;
+}
+
+.header-status {
+    align-items: flex-end;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    gap: 6px;
+}
+
+
+/* The Quora wordmark in the header: white on the red popup header, brand red on the wide page's white header card (6 Nov). */
+.header .quora-home-link {
+    color: var(--mb-white);
+}
+
+@media (min-width: 720px) {
+    .header .quora-home-link {
+        color: var(--mb-brand-red);
     }
 }

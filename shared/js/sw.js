@@ -27,6 +27,7 @@ const {
     COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT,
     COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT,
     DEV_MODE_SYNC_STORAGE_KEY,
+    FLIGHT_RECORDER_AUTOSAVE_KEY,
     HIDDEN_RUNS_KEY,
     STORAGE_BUILD_KEY,
     OWNED_TAB_STATE_KEY,
@@ -735,6 +736,7 @@ const COORDINATOR_DASHBOARD_STATE_KEYS = makeCoordinatorDashboardStateKeys([
     COORDINATOR_AUTO_START_ON_BROWSER_START_KEY,
     COORDINATOR_QUEUE_VIEW_KEY,
     DEV_MODE_SYNC_STORAGE_KEY,
+    FLIGHT_RECORDER_AUTOSAVE_KEY,
     COORDINATOR_OUTLIERS_KEY
 ])
 const SERVICE_WORKER_QUEUE_OWNER_ID = 'service-worker-queue-owner'
@@ -6565,16 +6567,20 @@ function summarizeFinishedWorkInPopulation(items = []) {
 // The list (view.items) shows live rows only. A row is live when the archive gate keeps it in the queue, which is the rule of
 // isArchivableCoordinatorRow read from the raw row, as the gate reads it. Finished rows stay in the completed-work log, and the page
 // counts them from the view total.
-function buildCoordinatorQueueViewFromDashboardSnapshot(snapshot) {
+// listLimit 0 lists every live row (the initial load). A positive listLimit lists only the head of the queue, in queue order: a polled
+// refresh asks for that (owner, 5 Nov). The counts, total and summaries always cover every row.
+function buildCoordinatorQueueViewFromDashboardSnapshot(snapshot, listLimit = 0) {
     const queue = mergeCoordinatorCompletedRowsIntoQueue(snapshot.queue, snapshot.completedRows)
     const populationView = mergeCoordinatorQueueViewTimingCache(buildCoordinatorQueueView(queue, Date.now(), {runs: snapshot.runs, statsClearedAt: coordinatorStatsClearedAtResident}))
     const population = populationView.items
-    const items = population.filter(item => !isArchivableCoordinatorRow(queue[item.storageKey]))
+    const liveRows = population.filter(item => !isArchivableCoordinatorRow(queue[item.storageKey]))
+    const items = listLimit > 0 ? liveRows.slice(0, listLimit) : liveRows
     return {
         view: {
             ...populationView,
             items,
-            itemLimit: items.length,
+            itemLimit: listLimit > 0 ? listLimit : items.length,
+            truncated: liveRows.length > items.length,
             softFailRetry: summarizeSoftFailRetryCounts(population),
             finishedWork: summarizeFinishedWorkInPopulation(population),
             completedSummary: snapshot.completedSummary
@@ -6982,7 +6988,7 @@ async function refreshCoordinatorRunsViewForDashboard(reason = 'dashboard-refres
 // What the dashboard's loadState asks for on every poll: both views from one
 // authority read, instead of two round trips that each replay the same WAL and
 // completed-work log.
-async function refreshCoordinatorDashboardViewsForDashboard(reason = 'dashboard-refresh') {
+async function refreshCoordinatorDashboardViewsForDashboard(reason = 'dashboard-refresh', listLimit = 0) {
     recordFlightRecorderEvent({
         kind: 'dashboard-refresh',
         source: 'refreshCoordinatorDashboardViewsForDashboard',
@@ -6990,7 +6996,7 @@ async function refreshCoordinatorDashboardViewsForDashboard(reason = 'dashboard-
     })
     const {snapshot, unavailable} = await readDashboardSnapshotOrUnavailable(reason, `dashboardViews.${reason}`)
     if(unavailable) return unavailable
-    const {view} = buildCoordinatorQueueViewFromDashboardSnapshot(snapshot)
+    const {view} = buildCoordinatorQueueViewFromDashboardSnapshot(snapshot, listLimit)
     const runs = buildCoordinatorRunsSummaryFromDashboardSnapshot(snapshot)
     recordDashboardViewRowCounts('refreshCoordinatorDashboardViewsForDashboard', reason, snapshot, view)
     // The outlier list: the finished outliers are stored, and only the active live rows are judged here (swCoordinatorOutliers.js). The
@@ -12326,9 +12332,39 @@ async function openCoordinatorPageOnce(options = {}) {
 let coordinatorHistoryOpenPromise = null
 
 async function openCoordinatorHistoryPage(options = {}) {
+    // A History open is recorded from its request to its result (5 Nov). "joined-in-flight" means an earlier open has not finished, so a request
+    // that never gets a result shows here as a start with no finish.
+    recordFlightRecorderEvent({
+        kind: 'history-open-request',
+        source: 'openCoordinatorHistoryPage',
+        windowId: Number.parseInt(options.windowId, 10) || null,
+        accepted: true,
+        reason: coordinatorHistoryOpenPromise ? 'joined-in-flight' : 'start',
+        clickToRequestMs: options.clickedAt ? Date.now() - options.clickedAt : null
+    })
     if(coordinatorHistoryOpenPromise) return coordinatorHistoryOpenPromise
 
     coordinatorHistoryOpenPromise = openCoordinatorHistoryPageOnce(options)
+        .then(result => {
+            recordFlightRecorderEvent({
+                kind: 'history-open-result',
+                source: 'openCoordinatorHistoryPage',
+                tabId: result?.tabId || null,
+                windowId: result?.windowId || null,
+                accepted: true,
+                reason: result?.reused ? 'reused-existing-tab' : 'created-tab'
+            })
+            return result
+        })
+        .catch(error => {
+            recordFlightRecorderEvent({
+                kind: 'history-open-error',
+                source: 'openCoordinatorHistoryPage',
+                accepted: false,
+                error: `${error?.message || error || 'history-open-failed'}`.slice(0, 200)
+            })
+            throw error
+        })
         .finally(() => {
             coordinatorHistoryOpenPromise = null
         })
@@ -12350,6 +12386,15 @@ async function openCoordinatorHistoryPageOnce(options = {}) {
     // Same tabs.query hash-blindness as dedupeCoordinatorTabsOnce -- filter
     // down to tabs whose actual URL is this exact history view.
     const existing = matches.find(tab => tab?.id && `${tab.url || ''}`.endsWith(COORDINATOR_HISTORY_HASH))
+    recordFlightRecorderEvent({
+        kind: 'history-open-match',
+        source: 'openCoordinatorHistoryPageOnce',
+        tabId: existing?.id || null,
+        windowId: existing?.windowId || null,
+        accepted: true,
+        reason: existing?.id ? 'existing-history-tab' : 'no-history-tab',
+        queued: matches.length
+    })
     if(existing?.id) {
         return maybeActivateCoordinatorTab({tabId: existing.id, windowId: existing.windowId || null}, {...options, expectedUrl: historyUrl})
     }
@@ -21909,6 +21954,13 @@ async function setDevModeEnabledRequested(enabled = false) {
     return {ok: true}
 }
 
+// The flight recorder's Save-every setting, stored the same way as dev mode (4 Nov). Only 0 and 50 are kept.
+async function setFlightRecorderAutosaveRequested(every = 0) {
+    const value = Number.parseInt(every, 10) === 50 ? 50 : 0
+    await metricStorageSet({[FLIGHT_RECORDER_AUTOSAVE_KEY]: value}, {metricPath: 'dashboardRequest.setFlightRecorderAutosave'})
+    return {ok: true}
+}
+
 async function setHiddenRunIdsRequested(runIds = []) {
     const ids = Array.isArray(runIds) ? [...new Set(runIds.map(id => `${id || ''}`).filter(Boolean))] : []
     await metricStorageSet({[HIDDEN_RUNS_KEY]: ids}, {metricPath: 'dashboardRequest.setHiddenRuns'})
@@ -24081,12 +24133,20 @@ async function enqueueCoordinatorItemsStorageOnce(request = {}) {
 // persist) if a chunk comes back non-durable or timed out; whatever
 // already-durable rows exist by then are left for reconcile to pick up
 // normally, matching how a single-batch storage timeout is already handled.
+function mergedKeyList(rawItem = null, targetProfileHref = '') {
+    if (targetProfileHref) return [targetProfileHref]
+    const evidence = Array.isArray(rawItem?.evidence) ? rawItem.evidence : []
+    return evidence.map(entry => `${entry?.postKey || ''}`.trim()).filter(Boolean)
+}
+
 async function enqueueCoordinatorItemsStorageChunked(request = {}, rawItems = []) {
     const runInput = request.run && typeof request.run === 'object' ? request.run : {}
     const hasExecuteInput = request.execute && typeof request.execute === 'object'
     let queued = 0
     let merged = 0
     const mergedHrefs = []
+    const mergedKeys = []
+    const mergedRows = {}
     let runId = runInput.id || ''
     let durable = false
     let storageTimedOut = false
@@ -24103,6 +24163,8 @@ async function enqueueCoordinatorItemsStorageChunked(request = {}, rawItems = []
         queued += Number.parseInt(chunkResult?.queued, 10) || 0
         merged += Number.parseInt(chunkResult?.merged, 10) || 0
         if(Array.isArray(chunkResult?.mergedHrefs)) mergedHrefs.push(...chunkResult.mergedHrefs)
+        if(Array.isArray(chunkResult?.mergedKeys)) mergedKeys.push(...chunkResult.mergedKeys)
+        if(chunkResult?.mergedRows && typeof chunkResult.mergedRows === 'object') Object.assign(mergedRows, chunkResult.mergedRows)
         if(!runId && chunkResult?.runId) runId = chunkResult.runId
         if(Array.isArray(chunkResult?.resetCleanupTargets)) {
             resetCleanupTargets.push(...chunkResult.resetCleanupTargets)
@@ -24126,6 +24188,8 @@ async function enqueueCoordinatorItemsStorageChunked(request = {}, rawItems = []
         queued,
         merged,
         mergedHrefs,
+        mergedKeys,
+        mergedRows,
         executionQueued: 0,
         runId,
         coordinatorTabId: null,
@@ -24182,6 +24246,11 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
     let merged = 0
     // Owner, 23 Oct: the profiles this batch merged into existing rows, so the page can clear its pending records for them.
     const mergedHrefs = []
+    // The page's own key for each merged item, so it can drop the matching candidate (6 Nov): the profile address, or for a post that
+    // still needs its profile, the post key in its evidence.
+    const mergedKeys = []
+    // The live rows the merged items joined, so the page can hold them in its copy of the queue (6 Nov).
+    const mergedRows = {}
     let progressChanged = false
     const progressResetRecords = {}
     const authorityResults = []
@@ -24268,7 +24337,11 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
             // queue (which would just get archived out again next tick,
             // achieving nothing but churn), and don't open a tab for it.
             merged += 1
+            // A merged resolve row has no profile yet, so it is reported under its chase key, the same key the page holds it by (6 Nov).
             if(targetProfileHref) mergedHrefs.push(targetProfileHref)
+            else if(requestedUrl && isProfileResolutionMode(requestedResolutionMode)) mergedHrefs.push(`resolve-profile:${requestedUrl}`)
+            mergedKeys.push(...mergedKeyList(rawItem, targetProfileHref))
+            if(existingLive) mergedRows[coordinatorKey] = existingLive
             if(itemSource?.pageUrl) sourcePages.add(itemSource.pageUrl)
             continue
         }
@@ -24388,7 +24461,11 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         }
         if(existing) {
             merged += 1
+            // A merged resolve row has no profile yet, so it is reported under its chase key, the same key the page holds it by (6 Nov).
             if(targetProfileHref) mergedHrefs.push(targetProfileHref)
+            else if(requestedUrl && isProfileResolutionMode(requestedResolutionMode)) mergedHrefs.push(`resolve-profile:${requestedUrl}`)
+            mergedKeys.push(...mergedKeyList(rawItem, targetProfileHref))
+            if(existingLive) mergedRows[coordinatorKey] = existingLive
         }
         else queued += 1
 
@@ -24576,6 +24653,8 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         queued,
         merged,
         mergedHrefs,
+        mergedKeys,
+        mergedRows,
         executionQueued: 0,
         runId,
         coordinatorTabId: null,
@@ -31554,7 +31633,10 @@ async function getOwnedNukeStatus(parentTabId, options = {}) {
     const active = activeKeys.size
     const queued = queuedKeys.size
     const hasWork = active > 0 || owned > 0 || queued > 0
-    const paused = hasWork && (queueRuntime.hasPausedQueuedOwner(parentTabId) || (runId && queueRuntime.hasPausedQueuedOwner(SERVICE_WORKER_QUEUE_OWNER_ID)))
+    // The stored pause flag is the answer (4 Nov). The in-memory owner set is only a fallback: after a worker restart it can be empty while the
+    // queue is still paused, and a popup that read "not paused" would wait out its whole timeout.
+    const storedPaused = hasWork && await isCoordinatorPausedInStorage('owned-nuke-status-paused-check')
+    const paused = hasWork && (storedPaused || queueRuntime.hasPausedQueuedOwner(parentTabId) || (runId && queueRuntime.hasPausedQueuedOwner(SERVICE_WORKER_QUEUE_OWNER_ID)))
     if(!hasWork) {
         queueRuntime.resumeQueuedOwner(parentTabId)
     }
@@ -35758,7 +35840,9 @@ async function getContentPageCoordinatorState(request = {}, sender = {}) {
                     status: 'archived-terminal',
                     blockSucceeded: false,
                     terminalAt: Number.parseInt(liveItem.terminalAt, 10) || Date.now(),
-                    finalError: '',
+                    // The row's own outcome and error are the reason; archived-terminal is only the fallback when the row gave neither (3 Nov).
+                    unavailableReason: `${liveItem.outcome || ''}`.trim(),
+                    finalError: `${liveItem.error || ''}`.trim(),
                     event: 'Settled from the live queue row'
                 }
             continue
@@ -35774,7 +35858,8 @@ async function getContentPageCoordinatorState(request = {}, sender = {}) {
                 status: 'archived-terminal',
                 blockSucceeded: false,
                 terminalAt: Number.parseInt(archived.terminalAt, 10) || Date.now(),
-                finalError: '',
+                unavailableReason: outcome,
+                finalError: `${archived.error || ''}`.trim(),
                 event: 'Settled from the archived queue row'
             }
             continue
@@ -35914,6 +35999,7 @@ registerServiceWorkerListeners({
         setSpaceSortRequested,
         setSpaceRecordRequested,
         setDevModeEnabledRequested,
+        setFlightRecorderAutosaveRequested,
         setHiddenRunIdsRequested,
         claimDebugRunAutosaveRequested,
         registerQueuedWorkerActionSurfaceRequested,

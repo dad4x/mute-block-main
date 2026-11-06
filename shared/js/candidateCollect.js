@@ -114,4 +114,14 @@ function createAdaptiveCollectWait({floorMs = 500, ceilingMs = 10000} = {}) {
     }
 }
 
-module.exports = {formatElapsed, formatCollectStopLabel, STOP_COLLECT_LABEL_TEXT, collectPassMadeProgress, runCollectLoop, createAdaptiveCollectWait}
+// The stop reason a collect leaves on its button. The space page and the contributors popup both use it (4 Nov), so the words and the time
+// are the same in both places. noun names what was collected; endLabel says how the feed or list ended.
+function formatCollectEndNotice({stopped = false, collected = 0, endReached = false, stalled = false, elapsedMs = 0, noun = 'posts', endLabel = 'end of feed'} = {}) {
+    if(stopped) return 'Stopped'
+    if(collected < 1) return `No new ${noun}`
+    const timed = ` · ${formatElapsed(elapsedMs)}`
+    if(stalled) return `Collected ${collected} · stalled${timed}`
+    return endReached ? `Collected ${collected} · ${endLabel}${timed}` : `Collected ${collected}${timed}`
+}
+
+module.exports = {formatElapsed, formatCollectStopLabel, formatCollectEndNotice, STOP_COLLECT_LABEL_TEXT, collectPassMadeProgress, runCollectLoop, createAdaptiveCollectWait}

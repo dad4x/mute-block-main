@@ -229,6 +229,7 @@ function registerServiceWorkerListeners(deps = {}) {
         setSpaceSortRequested,
         setSpaceRecordRequested,
         setDevModeEnabledRequested,
+        setFlightRecorderAutosaveRequested,
         setHiddenRunIdsRequested,
         claimDebugRunAutosaveRequested,
         registerQueuedWorkerActionSurfaceRequested,
@@ -667,10 +668,28 @@ function registerServiceWorkerListeners(deps = {}) {
         noteStorageRemovals(ownChanges)
         return runAfterCoordinatorAuthorityReady(() => handleStorageChanged(ownChanges, areaName))
     })
+    // A History open is noted on arrival, before the authority gate, so a delay can be split into the trip from the click, the wait for
+    // the authority, and the open itself (5 Nov). The gate is not changed; this only records.
+    const HISTORY_OPEN_ARRIVAL_ACTION = 'open-coordinator-history'
+    function recordHistoryOpenArrival(request = {}) {
+        const arrivedAt = Date.now()
+        const clickedAt = Number.parseInt(request.clickedAt, 10) || 0
+        const pending = ensureCoordinatorAuthorityHydrated()
+        if(pending) pending.catch(() => null)
+        recordFlightRecorderEvent({
+            kind: 'history-open-arrival',
+            source: 'swBootstrap',
+            accepted: true,
+            clickToArrivalMs: clickedAt ? arrivedAt - clickedAt : null,
+            authorityReady: pending === null
+        })
+    }
+
     browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const action = normalizeRuntimeMessageAction(request)
         request = {...(request || {}), action}
         markQuoraRuntimeActivatedFromRequest(request, sender, `message:${describeRuntimeMessage(request)}`)
+        if(request.action === HISTORY_OPEN_ARRIVAL_ACTION) recordHistoryOpenArrival(request)
         if(!RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY.has(request.action)) return dispatchRuntimeMessage(request, sender)
         return runAfterCoordinatorAuthorityReady(() => dispatchRuntimeMessage(request, sender), {respond: true})
     })
@@ -678,21 +697,13 @@ function registerServiceWorkerListeners(deps = {}) {
     function dispatchRuntimeMessage(request, sender) {
     
         if(request.action === 'create-tab') {
-            return createOwnedTab({
+            // A tab the user asked for to look at (Open Profiles, contributor links). It is not a worker tab, so it opens in the window the
+            // click came from and does not touch the queue's window (4 Nov). It opens in the background, so it does not take focus.
+            return browser.tabs.create({
                 url: request.url,
-                ownerTabId: sender.tab?.id || null,
-                ownerWindowId: sender.tab?.windowId || null
-            }).then(tab => {
-                if(request.tabAction) {
-                    queueRuntime.setPendingTabAction(tab.id, {
-                        action: request.tabAction,
-                        profileHref: normalizeQuoraProfileUrl(request.url || ''),
-                        targetUrl: request.url || '',
-                        requestedUrl: request.url || ''
-                    })
-                }
-                return {tabId: tab.id}
-            })
+                windowId: Number.parseInt(sender.tab?.windowId, 10) || undefined,
+                active: false
+            }).then(tab => ({tabId: tab.id}))
         }
         else if(request.action === 'enqueue-coordinator-items') {
             return enqueueCoordinatorItems(request, sender)
@@ -710,7 +721,8 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'open-coordinator-history') {
             return openCoordinatorHistoryPage({
                 windowId: Number.parseInt(request.windowId, 10) || sender.tab?.windowId || null,
-                active: request.active === true
+                active: request.active === true,
+                clickedAt: Number.parseInt(request.clickedAt, 10) || 0
             })
         }
         else if(request.action === 'coordinator-page-ready') {
@@ -756,6 +768,9 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'set-dev-mode-enabled') {
             return setDevModeEnabledRequested(request.enabled === true)
+        }
+        else if(request.action === 'set-flight-recorder-autosave') {
+            return setFlightRecorderAutosaveRequested(request.every)
         }
         else if(request.action === 'set-hidden-run-ids') {
             return setHiddenRunIdsRequested(request.runIds)
@@ -891,7 +906,7 @@ function registerServiceWorkerListeners(deps = {}) {
             return refreshCoordinatorRunsViewForDashboard(request.reason || 'dashboard-refresh')
         }
         else if(request.action === 'refresh-coordinator-dashboard-views') {
-            return refreshCoordinatorDashboardViewsForDashboard(request.reason || 'dashboard-refresh')
+            return refreshCoordinatorDashboardViewsForDashboard(request.reason || 'dashboard-refresh', Number.parseInt(request.listLimit, 10) || 0)
         }
         else if(request.action === 'get-coordinator-queue-accounting') {
             return getCoordinatorQueueAccounting(request)

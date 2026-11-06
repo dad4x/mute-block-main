@@ -332,8 +332,11 @@ test('the page progress bar and the dashboard footer bar are both built by the o
     assert.match(shared, /function createQueueProgressBar\(options = \{\}\)/)
     assert.match(content, /const \{ createQueueProgressBar \} = require\('\.\/queueProgressBar'\)/)
     assert.match(content, /const \{ bar \} = createQueueProgressBar\(\{/)
-    assert.match(coordinator, /const \{createQueueProgressBar\} = require\('\.\/queueProgressBar'\)/)
-    assert.match(coordinator, /dashboardBottomBarProgress = createQueueProgressBar\(\{/)
+    // The dashboard's footer bar is the one shared bottom bar (queueBottomBar.js, 6 Nov), which builds it with the same function.
+    assert.match(coordinator, /const \{createQueueBottomBar, refreshQueueBarFromSummary\} = require\('\.\/queueBottomBar'\)/)
+    const bottomBar = readRepoFile('shared/js/queueBottomBar.js')
+    assert.match(bottomBar, /const \{createQueueProgressBar\} = require\('\.\/queueProgressBar'\)/)
+    assert.match(bottomBar, /const progress = createQueueProgressBar\(\{/)
     // No second copy of the bar's markup is left in the dashboard page.
     assert.doesNotMatch(html, /dashboard-bottom-bar/)
 })

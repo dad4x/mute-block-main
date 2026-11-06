@@ -14,7 +14,11 @@ const {
     COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS
 } = require('./timeouts')
 const defaults = require('./defaults')
-const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, DASHBOARD_WORK_SESSION_REDRAW_MS, DASHBOARD_WORK_SESSION_REFRESH_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT, OUTLIER_EVENT_GAP_ABNORMAL_MS, HISTOGRAM_DURATION_EDGES_SEC} = require('./tunables')
+const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, DASHBOARD_WORK_SESSION_REDRAW_MS, DASHBOARD_WORK_SESSION_REFRESH_MS, DASHBOARD_QUEUE_POLL_HEAD_LIMIT, QUEUE_BAR_PAGE_POLL_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT, OUTLIER_EVENT_GAP_ABNORMAL_MS, HISTOGRAM_DURATION_EDGES_SEC} = require('./tunables')
+// The one bottom bar every page uses (queueBottomBar.js, 6 Nov).
+const {createQueueBottomBar, refreshQueueBarFromSummary} = require('./queueBottomBar')
+const {installButtonPressListener} = require('./buttonPressEvents')
+const {openExtensionPageFromHere} = require('./extensionPages')
 const {createQueueProgressBar} = require('./queueProgressBar')
 const {
     COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
@@ -22,8 +26,8 @@ const {
     COORDINATOR_WORK_SESSION_KEY,
     COORDINATOR_QUEUE_VIEW_KEY,
     COORDINATOR_RETRY_FAILED_ENABLED_KEY,
-    COORDINATOR_RUNS_KEY,
     DEV_MODE_SYNC_STORAGE_KEY,
+    FLIGHT_RECORDER_AUTOSAVE_KEY,
     HIDDEN_RUNS_KEY,
     QUEUE_WAKEUP_METRICS_VIEW_KEY,
     SPACE_REGISTRY_KEY
@@ -130,12 +134,31 @@ addEventListener('hashchange', () => {
     location.reload()
 })
 
+// Opens the History page from this page, with no trip through the worker (6 Nov): the worker's queue is busy during a run, and a History
+// request queued behind it took seconds. The page looks for an open History tab and reuses it, else creates one in this window. The
+// open is then reported to the worker's recorder as a page event with its timing; that report is not on the open's path.
+async function openHistoryPageFromHere(clickedAt = Date.now()) {
+    return openExtensionPageFromHere(browser, {page: 'history', clickedAt, report: reportPageOpen})
+}
+
+// The page open, recorded in the worker's recorder as a page event with its timing (6 Nov). Not on the open's path.
+function reportPageOpen(detail) {
+    void sendRuntimeMessageWithTimeout({action: 'record-page-event', event: 'page-open', detail: `${detail}`, clientAt: Date.now()}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+}
+
 async function openCoordinatorViewFromHere(action = 'open-coordinator') {
+    // The click time travels with the request, so the worker's recorder can show how long the open took from the click (5 Nov).
+    const clickedAt = Date.now()
+    if(action === 'open-coordinator-history') {
+        await openHistoryPageFromHere(clickedAt)
+        return
+    }
     const currentWindow = await browser.windows.getCurrent().catch(() => null)
     await sendRuntimeMessageWithTimeout({
         action,
         active: true,
-        windowId: currentWindow?.id || null
+        windowId: currentWindow?.id || null,
+        clickedAt
     }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
 }
 
@@ -144,6 +167,12 @@ async function openCoordinatorViewFromHere(action = 'open-coordinator') {
 const HISTORY_REFRESH_INTERVAL_MS = 2000
 const HISTORY_FULL_REFRESH_EVERY_TICKS = 30
 let historyRows = new Map()
+// The keys in the order their rows arrived, oldest first (5 Nov). Nothing is sorted: a new row goes on the newest end of its list.
+// Time mode walks historyOrder. Errors mode walks historyErrorOrder, then historyOtherOrder. A key can sit in a list twice when its row was
+// replaced by a newer one; the walk takes the newest place and skips the rest.
+let historyOrder = []
+let historyErrorOrder = []
+let historyOtherOrder = []
 // When the page was last cleared. Rows completed at or before this time stay off the page, and rows completed after it show.
 let historyClearedAt = 0
 let historySince = 0
@@ -154,6 +183,9 @@ let historyTickCount = 0
 let historyFilterText = ''
 // Whether Remove duplicates is checked: when on, only the newest row for each profile shows. Kept here for the same reason.
 let historyDedupeEnabled = false
+// How many history rows are built on the page at once, and how many more each "Show more" adds (5 Nov).
+const HISTORY_VISIBLE_STEP = 300
+let historyVisibleLimit = HISTORY_VISIBLE_STEP
 
 // The completion status as a word: Succeeded, Failed, Skipped or Canceled.
 function historyStatusLabel(row = {}) {
@@ -224,25 +256,41 @@ async function refreshHistoryRows(full = false) {
     }
     const firstAnswer = historyFirstLoadState !== 'loaded'
     historyFirstLoadState = 'loaded'
-    const before = historyRows.size
-    if(full) historyRows = new Map()
+    if(full) {
+        historyRows = new Map()
+        resetHistoryOrder()
+    }
     let added = false
-    for(const row of result.rows) {
-        const key = `${row.coordinatorKey || row.targetProfileHref || ''}`
-        if(!key || historyRowAt(row) <= historyClearedAt) continue
-        if(!historyRows.has(key)) added = true
-        historyRows.set(key, row)
+    // The worker answers newest first; the rows go in oldest first, so each one lands on the newest end of its list.
+    for(const row of [...result.rows].reverse()) {
+        if(historyAcceptRow(row)) added = true
     }
     historySince = Math.max(historySince, Number(result.latest) || 0)
-    if(full || added || historyRows.size !== before || firstAnswer) renderHistoryRows()
+    if(full || added || firstAnswer) renderHistoryRows()
 }
 
-// The order of the status groups: errors first, so they group together.
-const HISTORY_STATUS_ORDER = ['failed', 'skipped', 'canceled', 'succeeded']
+function resetHistoryOrder() {
+    historyOrder = []
+    historyErrorOrder = []
+    historyOtherOrder = []
+}
 
-function historyStatusRank(row = {}) {
-    const rank = HISTORY_STATUS_ORDER.indexOf(`${row.status || ''}`)
-    return rank === -1 ? HISTORY_STATUS_ORDER.length : rank
+// Keeps one row. Returns true when the row is new, newer than the one kept, or has moved between the errors and other groups: those
+// are the rows that go on the end of an order list. A repeat of the row the page already has changes nothing in the order (5 Nov).
+function historyAcceptRow(row = {}) {
+    const key = `${row.coordinatorKey || row.targetProfileHref || ''}`
+    if(!key || historyRowAt(row) <= historyClearedAt) return false
+    const previous = historyRows.get(key)
+    if(previous && historyRowAt(row) < historyRowAt(previous)) return false
+    const movedGroup = !!previous && historyRowHasError(previous) !== historyRowHasError(row)
+    const isNew = !previous || historyRowAt(row) > historyRowAt(previous) || movedGroup
+    if(isNew) {
+        historyOrder.push(key)
+        if(historyRowHasError(row)) historyErrorOrder.push(key)
+        else historyOtherOrder.push(key)
+    }
+    historyRows.set(key, row)
+    return isNew
 }
 
 // The filter's words: split on spaces, lowercased. An empty filter has none.
@@ -280,20 +328,16 @@ function historyRowProfileKey(row = {}) {
 }
 
 // With Remove duplicates on, only the newest row for each profile stays (by completion time). A row with no profile key is always kept.
-// The rows keep the order they came in.
-function historyDedupeRows(rows = [], enabled = false) {
-    if(!enabled) return rows
+// One pass over the rows; nothing is sorted.
+function historyNewestRowByProfile() {
     const newestByKey = new Map()
-    for(const row of rows) {
+    for(const row of historyRows.values()) {
         const key = historyRowProfileKey(row)
         if(!key) continue
         const current = newestByKey.get(key)
         if(!current || historyRowAt(row) > historyRowAt(current)) newestByKey.set(key, row)
     }
-    return rows.filter(row => {
-        const key = historyRowProfileKey(row)
-        return !key || newestByKey.get(key) === row
-    })
+    return newestByKey
 }
 
 // A row shows when every typed word appears in at least one of its fields (case-insensitive, in any order). An empty filter shows every row.
@@ -304,29 +348,67 @@ function historyRowMatchesFilter(row = {}, text = '') {
     return words.every(word => fields.some(field => field.includes(word)))
 }
 
-// The rows in the order the History page's sort control asks for. Newest first is the default.
-function sortHistoryRows(rows = []) {
-    const sortMode = document.getElementById('historySort')?.value || 'newest'
-    return rows.sort((left, right) => {
-        if (sortMode === 'status') {
-            const byStatus = historyStatusRank(left) - historyStatusRank(right)
-            if (byStatus) return byStatus
+// The rows in the order the page shows them, newest first, one at a time. Time mode walks historyOrder from its newest end. Errors mode
+// walks the errors list from its newest end, then the other list. Nothing is sorted, and the walk stops building anything once the
+// caller stops asking (5 Nov). Each key is taken once, at its newest place.
+function* historyDisplayRows(errorsFirst = false, dedupe = false) {
+    const newestByProfile = dedupe ? historyNewestRowByProfile() : null
+    const lists = errorsFirst
+        ? [
+            {keys: historyErrorOrder, accepts: row => historyRowHasError(row)},
+            {keys: historyOtherOrder, accepts: row => !historyRowHasError(row)}
+        ]
+        : [{keys: historyOrder, accepts: () => true}]
+    const taken = new Set()
+    for(const {keys, accepts} of lists) {
+        for(let index = keys.length - 1; index >= 0; index -= 1) {
+            const key = keys[index]
+            const row = historyRows.get(key)
+            if(!row || taken.has(key) || !accepts(row)) continue
+            taken.add(key)
+            const profileKey = historyRowProfileKey(row)
+            if(newestByProfile && profileKey && newestByProfile.get(profileKey) !== row) continue
+            yield row
         }
-        return historyRowAt(right) - historyRowAt(left)
-    })
+    }
 }
 
 function renderHistoryRows() {
-    const allRows = [...historyRows.values()]
-    // Remove duplicates is applied first, then the text filter; the count shows what is left, out of every row the page holds.
-    const rows = sortHistoryRows(historyDedupeRows(allRows, historyDedupeEnabled).filter(row => historyRowMatchesFilter(row, historyFilterText)))
+    const errorsFirst = (document.getElementById('historySort')?.value || 'newest') === 'status'
+    // Remove duplicates is applied first, then the text filter. The count shows the matches, out of every row the page holds.
+    // Only the visible rows are built, so a redraw costs the same whatever the history holds (5 Nov). "Show more" adds the next batch.
+    const shown = []
+    let matching = 0
+    for(const row of historyDisplayRows(errorsFirst, historyDedupeEnabled)) {
+        if(!historyRowMatchesFilter(row, historyFilterText)) continue
+        matching += 1
+        if(shown.length < historyVisibleLimit) shown.push(row)
+    }
     const countEl = document.getElementById('historyCount')
-    if(countEl) countEl.textContent = [`Showing ${rows.length} of ${allRows.length}`, historyClearNotice].filter(Boolean).join('. ')
+    const countText = shown.length < matching
+        ? `Showing ${shown.length} of ${matching} matching, ${historyRows.size} in history`
+        : `Showing ${matching} of ${historyRows.size}`
+    if(countEl) countEl.textContent = [countText, historyClearNotice].filter(Boolean).join('. ')
 
     const list = document.getElementById('historyList')
     if(!list) return
 
-    replaceChildren(list, rows.map(row => {
+    const showMore = []
+    if(matching > shown.length) {
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'clear-button'
+        button.id = 'historyShowMoreButton'
+        button.textContent = `Show ${Math.min(HISTORY_VISIBLE_STEP, matching - shown.length)} more`
+        setMuteBlockHelp(button, 'Mute Block extension: Draw the next rows of the history')
+        button.addEventListener('click', () => {
+            historyVisibleLimit += HISTORY_VISIBLE_STEP
+            renderHistoryRows()
+        })
+        showMore.push(button)
+    }
+
+    replaceChildren(list, shown.map(row => {
         const profileHref = row.targetProfileHref || row.requestedUrl || ''
         const profileLabel = profileHref ? getProfileLabelFromHref(profileHref) : ''
         const titleLabel = profileLabel || `${row.coordinatorKey || 'Unknown profile'}`
@@ -344,7 +426,7 @@ function renderHistoryRows() {
         element.className = historyRowHasError(row) ? 'row row--history-error' : 'row'
         element.append(buildTitleCell(titleLabel, subtitle, {titleHref: profileHref, subtitleHref: historyRowPostUrl(row) || historyRowSpaceUrl(row)}))
         return element
-    }), allRows.length ? 'No history rows match the filter.' : 'No history yet.', historyFirstLoadState)
+    }).concat(showMore), historyRows.size ? 'No history rows match the filter.' : 'No history yet.', historyFirstLoadState)
 }
 
 async function renderHistoryList() {
@@ -376,6 +458,7 @@ async function clearHistory() {
     historyClearedAt = Date.now()
     historyClearNotice = ''
     historyRows = new Map()
+    resetHistoryOrder()
     renderHistoryRows()
 }
 
@@ -386,8 +469,8 @@ async function clearHistory() {
 // 2026-09-29 (screenshot): the worker bar and the history header both
 // rendered stacked on top of the plain dashboard.
 // The dashboard's footer bar is built by the same function as the page's progress bar (queueProgressBar.js), so the two look the same.
-let dashboardBottomBarProgress = null
-let dashboardBottomBarPauseResume = null
+// The bottom bar on this page (queueBottomBar.js). Built once, on the pages that have one: the dashboard and History.
+let queueBottomBar = null
 
 // The Pause/Resume label and its disabled state, shared by the footer and the #progress page so both read the same (3 Nov).
 function syncPauseResumeButton(button) {
@@ -402,46 +485,47 @@ function syncPauseResumeButton(button) {
     button.disabled = pausePending || resumePending
 }
 
-function installDashboardBottomBar() {
-    if(dashboardBottomBarProgress) return
-    dashboardBottomBarPauseResume = document.createElement('button')
-    dashboardBottomBarPauseResume.type = 'button'
-    dashboardBottomBarPauseResume.className = 'worker-bar-button'
-    dashboardBottomBarPauseResume.id = 'dashboardBottomBarPauseResume'
-    setMuteBlockHelp(dashboardBottomBarPauseResume, 'Mute Block extension: Pause the queue, or resume it')
-    dashboardBottomBarPauseResume.addEventListener('click', () => { void toggleCurrentWorkPause() })
-    dashboardBottomBarProgress = createQueueProgressBar({
-        barId: 'dashboardBottomBar',
-        iconSrc: 'icons/32.png',
-        interactive: true,
-        logoTitle: 'Open the dashboard',
+function installQueueBottomBar() {
+    if(queueBottomBar) return
+    queueBottomBar = createQueueBottomBar({
         onLogoClick: () => { void openDashboardFromBottomBar() },
-        controls: [dashboardBottomBarPauseResume]
+        onPauseClick: () => { void toggleCurrentWorkPause() }
     })
-    // The bar sets its own display style, which would override the hidden attribute, so it is shown and hidden through that style.
-    dashboardBottomBarProgress.bar.style.display = 'none'
-    document.body.appendChild(dashboardBottomBarProgress.bar)
 }
 
 function applyCoordinatorViewMode() {
-    installDashboardBottomBar()
+    const isWorkerBar = isQueuedWorkerActionSurfacePage()
+    const isHistory = isCoordinatorHistoryPage()
+    // The worker window has its own bar (.worker-bar), so the shared bottom bar is built on the dashboard and History only.
+    if(!isWorkerBar) installQueueBottomBar()
     const dashboardView = document.getElementById('dashboardView')
     const workerBarView = document.getElementById('workerBarView')
     const historyView = document.getElementById('historyView')
-    const dashboardBottomBar = dashboardBottomBarProgress?.bar || null
-    const isWorkerBar = isQueuedWorkerActionSurfacePage()
-    const isHistory = isCoordinatorHistoryPage()
 
     if(dashboardView) dashboardView.hidden = isWorkerBar || isHistory
     if(workerBarView) workerBarView.hidden = !isWorkerBar
     if(historyView) historyView.hidden = !isHistory
-    // Only the plain dashboard gets the footer bar -- the worker window has
-    // its own equivalent (.worker-bar) and History is just a short list.
-    if(dashboardBottomBar) dashboardBottomBar.style.display = isWorkerBar || isHistory ? 'none' : 'flex'
+}
+
+// The History page's bottom bar (6 Nov): the dashboard's bar, fed by the worker's queue-bar summary. The page reads no queue rows for it.
+// The paused flag is read from storage, which is allowed for the pause state; the bar's Pause and Resume is the only pause control here.
+async function refreshHistoryQueueBar() {
+    installQueueBottomBar()
+    const {paused} = await refreshQueueBarFromSummary(queueBottomBar, browser)
+    state.paused = paused
 }
 
 async function initHistoryPage() {
     document.title = 'History'
+    // The version under the title, from the manifest like the dashboard's (6 Nov).
+    const versionEl = document.getElementById('historyVersion')
+    if(versionEl) versionEl.textContent = `v${browser.runtime.getManifest().version}`
+    installQueueBottomBar()
+    void refreshHistoryQueueBar()
+    setInterval(() => {
+        if(document.hidden) return
+        void refreshHistoryQueueBar()
+    }, QUEUE_BAR_PAGE_POLL_MS)
     document.getElementById('clearHistoryButton')?.addEventListener('click', () => {
         void clearHistory()
     })
@@ -453,15 +537,20 @@ async function initHistoryPage() {
     })
     document.getElementById('historyFilter')?.addEventListener('input', event => {
         historyFilterText = `${event?.target?.value || ''}`
+        historyVisibleLimit = HISTORY_VISIBLE_STEP
         renderHistoryRows()
     })
     document.getElementById('historyDedupe')?.addEventListener('change', event => {
         historyDedupeEnabled = !!event?.target?.checked
+        historyVisibleLimit = HISTORY_VISIBLE_STEP
         renderHistoryRows()
     })
     showLoadingIndicator('historyList')
     await renderHistoryList()
-    document.getElementById('historySort')?.addEventListener('change', () => renderHistoryRows())
+    document.getElementById('historySort')?.addEventListener('change', () => {
+        historyVisibleLimit = HISTORY_VISIBLE_STEP
+        renderHistoryRows()
+    })
     setInterval(() => {
         if(document.hidden) return
         historyTickCount += 1
@@ -491,8 +580,15 @@ async function initWorkerBarPage() {
     render()
 }
 
+// A press on one of this page's buttons, recorded in the flight recorder with the page's name and the button's label (6 Nov).
+function reportExtensionButtonPress(label) {
+    const page = isCoordinatorHistoryPage() ? 'history' : isQueuedWorkerActionSurfacePage() ? 'worker-bar' : 'dashboard'
+    void sendRuntimeMessageWithTimeout({action: 'record-page-event', event: 'button-press', detail: `${page} ${label}`, clientAt: Date.now()}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+}
+
 async function init() {
     applyCoordinatorViewMode()
+    installButtonPressListener({report: reportExtensionButtonPress})
     if(isCoordinatorHistoryPage()) {
         await initHistoryPage()
         return
@@ -717,6 +813,10 @@ function applyCoordinatorDashboardStateFromMessage(incomingState = {}) {
         applyDevModeEnabled(incomingState[DEV_MODE_SYNC_STORAGE_KEY] === true)
         applied = true
     }
+    if(Object.prototype.hasOwnProperty.call(incomingState, FLIGHT_RECORDER_AUTOSAVE_KEY)) {
+        applyFlightRecorderAutosaveEvery(incomingState[FLIGHT_RECORDER_AUTOSAVE_KEY])
+        applied = true
+    }
     if(applied) render()
     return applied
 }
@@ -753,7 +853,8 @@ async function refreshDashboardStateFromCompactStorage() {
     if(state.loading) return false
     if(dashboardCompactRefreshPromise) return dashboardCompactRefreshPromise
 
-    dashboardCompactRefreshPromise = loadState()
+    // A polled refresh lists only the head of the queue (owner, 5 Nov). The initial load and the actions list the whole queue.
+    dashboardCompactRefreshPromise = loadState({listLimit: DASHBOARD_QUEUE_POLL_HEAD_LIMIT})
         .then(() => {
             if(state.firstStateReceived) state.loadError = ''
             render()
@@ -1043,11 +1144,9 @@ function installPanelWheelScrollListeners() {
     })
 }
 
+// One preferences tab: an open one is reused, so each press goes to the same tab (owner, 6 Nov).
 async function openPreferences() {
-    const url = browser.runtime.getURL('preferences.html')
-    await browser.tabs.create({url, active: true}).catch(() => {
-        window.open(url, '_blank', 'noopener')
-    })
+    await openExtensionPageFromHere(browser, {page: 'preferences', clickedAt: Date.now(), report: reportPageOpen})
 }
 
 async function startCoordinatorQueue() {
@@ -1160,9 +1259,10 @@ async function loadEventsFromFlightRecorder() {
     return result.entries.map(flightRecorderEntryToEvent).slice(-MAX_DASHBOARD_EVENTS)
 }
 
-async function loadState() {
+// The queue, completed and run records are WAL-backed, so the page never reads them from storage: the worker answers them by message
+// (owner rule, 5 Nov). The other keys here are not WAL data and are read from storage.
+async function loadState(options = {}) {
     const stored = await namespaceArea(browser.storage.local).get({
-        [COORDINATOR_RUNS_KEY]: {},
         [SPACE_REGISTRY_KEY]: {},
         [HIDDEN_RUNS_KEY]: [],
         [COORDINATOR_RETRY_FAILED_ENABLED_KEY]: false,
@@ -1190,7 +1290,7 @@ async function loadState() {
     // refreshDashboardStateFromCompactStorage) would otherwise just keep
     // re-reading that same stale snapshot forever instead of ever
     // correcting it.
-    const refreshed = await refreshCompactDashboardViews()
+    const refreshed = await refreshCompactDashboardViews(options)
     // The worker's first answer is the dashboard's first state (owner, 27 Oct): the spinner stops there. A first load the worker
     // never answers records a failure instead, so the spinner cannot run forever. A later unanswered refresh keeps the last view.
     if(refreshed.answered) state.firstStateReceived = true
@@ -1202,12 +1302,7 @@ async function loadState() {
     // architecture.md's "Derived Stats Must Not Be A Mutated Running Total"
     // and mutated-running-total-audit-todo-2026-09-25.md) and can lose
     // updates when several of a run's items terminalize in quick succession.
-    // Ask the service worker to compute run stats fresh from current
-    // authority plus the full completed-work log instead of trusting that
-    // storage copy; fall back to it only if the message truly fails.
-    if(!refreshed.runsRefreshed) {
-        state.runs = normalizeObject(stored[COORDINATOR_RUNS_KEY])
-    }
+    // The runs come from the worker's refresh above. If that refresh failed, the runs the page already holds stay (no storage copy is read).
     state.events = await loadEventsFromFlightRecorder()
     // The metrics view is held in session storage, never on disk (owner decision 26 Oct).
     const storedMetrics = await namespaceArea(browser.storage.session)?.get({[QUEUE_WAKEUP_METRICS_VIEW_KEY]: {}}).catch(() => null)
@@ -1229,10 +1324,12 @@ async function loadState() {
 // One round trip for both dashboard views. The service worker reads authority
 // once and derives the queue view and the runs summary from that read, so a
 // poll no longer pays for the same WAL replay twice.
-async function refreshCompactDashboardViews() {
+async function refreshCompactDashboardViews(options = {}) {
     const result = await sendRuntimeMessageWithTimeout({
         action: 'refresh-coordinator-dashboard-views',
-        reason: 'dashboard-load'
+        reason: 'dashboard-load',
+        // 0 lists the whole queue; a polled refresh passes the head limit (owner, 5 Nov).
+        listLimit: Number.parseInt(options.listLimit, 10) || 0
     }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
 
     const queueRefreshed = hasCoordinatorQueueView(result?.view)
@@ -1525,7 +1622,7 @@ function installWorkerBarPage(view) {
         button.addEventListener('click', onClick)
         return button
     }
-    workerBarButtons.pauseResume = makeButton('Pause', 'Mute Block extension: Pause the queue, or resume it', () => { void toggleCurrentWorkPause() })
+    workerBarButtons.pauseResume = makeButton('Pause', 'Mute Block extension: Pause the queue, or resume it', () => { void toggleCurrentWorkPause() }, ' pause-toggle')
     workerBarButtons.cancel = makeButton('Cancel', 'Mute Block extension: Cancel the Current Work in the queue', () => { void cancelCurrentWork() }, ' worker-bar-button--danger')
     const dashboardButton = makeButton('Dashboard', 'Mute Block extension: Open the dashboard', () => { void openCoordinatorViewFromHere('open-coordinator') })
     const historyButton = makeButton('History', 'Mute Block extension: Open the history page', () => { void openCoordinatorViewFromHere('open-coordinator-history') })
@@ -1562,14 +1659,18 @@ function renderWorkerBar(queueItems = []) {
 // with whatever render() just computed for the summary tiles, instead of
 // re-deriving it from state on its own.
 function renderDashboardBottomBar(queueItems = []) {
+    // The worker window has no shared bar, so there is nothing to draw there.
+    if(isQueuedWorkerActionSurfacePage()) return
     const total = getQueueTotalCount(queueItems)
     const terminal = getQueueTerminalCount(queueItems)
-    installDashboardBottomBar()
-    dashboardBottomBarProgress.setProgress(
-        total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0,
-        `${terminal} / ${total}`
-    )
-    syncPauseResumeButton(dashboardBottomBarPauseResume)
+    installQueueBottomBar()
+    queueBottomBar.update({
+        percent: total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0,
+        label: `${terminal} / ${total}`,
+        // The rule (owner, 4 Nov): the bar is there while there is work to be done, and vanishes when the queue is empty.
+        hasWork: total > 0 && terminal < total,
+        paused: state.paused
+    })
 }
 
 // The bottom-bar logo is a "jump to the real dashboard" shortcut, meant to
@@ -1631,6 +1732,7 @@ function render() {
     }
 
     const queueItems = getDisplayQueueItems()
+    // The History page's Pause or Resume label follows the queue (5 Nov).
     const runItems = getDisplayRuns(queueItems)
     refreshQuoraVisitRequirement(queueItems)
     const queuedCount = getQueueStatusCount('queued', queueItems)
@@ -1976,7 +2078,9 @@ async function toggleCurrentWorkPause() {
 
     const wasPaused = state.paused
     currentWorkPausePending = wasPaused ? 'resume' : 'pause'
-    render()
+    // On the History page the bar is the only control, and the page does not load the queue: only the bar is redrawn (6 Nov).
+    queueBottomBar?.setPending(currentWorkPausePending)
+    if(!isCoordinatorHistoryPage()) render()
     const request = state.paused
         ? {action: 'resume-paused-coordinator-nukes', debugLimit: readDebugResumeLimitFromControls()}
         : {action: 'pause-coordinator-nukes'}
@@ -1989,6 +2093,11 @@ async function toggleCurrentWorkPause() {
             : wasPaused ? 'resumed-current-work' : 'paused-current-work'
     }
     currentWorkPausePending = ''
+    queueBottomBar?.setPending('')
+    if(isCoordinatorHistoryPage()) {
+        await refreshHistoryQueueBar()
+        return
+    }
     await loadState()
     render()
 }
@@ -2050,8 +2159,7 @@ async function saveFlightRecorder() {
 // the dashboard is open and the setting is 50.
 const FLIGHT_RECORDER_AUTOSAVE_STEP = 50
 const FLIGHT_RECORDER_AUTOSAVE_POLL_MS = 5000
-// The setting lives in this page only, so it resets when the dashboard is reloaded. The worker owns stored settings; a stored
-// copy is a follow-up.
+// The setting is stored by the worker, the same way as dev mode, so it survives a dashboard reload (4 Nov).
 let flightAutosaveEvery = 0
 let flightAutosaveSeenAt = 0
 let flightAutosavePending = 0
@@ -2065,17 +2173,29 @@ function renderFlightRecorderSaveButton(every) {
     if(button) button.textContent = every === FLIGHT_RECORDER_AUTOSAVE_STEP ? `Save flight recorder every ${FLIGHT_RECORDER_AUTOSAVE_STEP} completed` : 'Save flight recorder'
 }
 
+// Applies the Save-every value to the drop-down, the button label and the poll. Used on load, on a change here, and on a push from another
+// dashboard (4 Nov). Only 0 and 50 are kept.
+function applyFlightRecorderAutosaveEvery(value) {
+    flightAutosaveEvery = Number.parseInt(value, 10) === FLIGHT_RECORDER_AUTOSAVE_STEP ? FLIGHT_RECORDER_AUTOSAVE_STEP : 0
+    const select = document.getElementById('flightRecorderAutosaveSelect')
+    if(select) select.value = String(flightAutosaveEvery)
+    renderFlightRecorderSaveButton(flightAutosaveEvery)
+}
+
+async function loadFlightRecorderAutosaveStored() {
+    const stored = await namespaceArea(browser.storage.local).get({[FLIGHT_RECORDER_AUTOSAVE_KEY]: 0}).catch(() => ({}))
+    applyFlightRecorderAutosaveEvery(stored[FLIGHT_RECORDER_AUTOSAVE_KEY])
+}
+
 function initFlightRecorderAutosave() {
     const select = document.getElementById('flightRecorderAutosaveSelect')
-    const every = readFlightRecorderAutosaveEvery()
-    if(select) select.value = String(every)
-    renderFlightRecorderSaveButton(every)
+    renderFlightRecorderSaveButton(readFlightRecorderAutosaveEvery())
+    void loadFlightRecorderAutosaveStored()
     select?.addEventListener('change', () => {
-        const next = Number.parseInt(select.value, 10) === FLIGHT_RECORDER_AUTOSAVE_STEP ? FLIGHT_RECORDER_AUTOSAVE_STEP : 0
-        flightAutosaveEvery = next
-        renderFlightRecorderSaveButton(next)
+        applyFlightRecorderAutosaveEvery(select.value)
         flightAutosaveSeenAt = 0
         flightAutosavePending = 0
+        void sendRuntimeMessageWithTimeout({action: 'set-flight-recorder-autosave', every: flightAutosaveEvery}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
     })
     setInterval(() => { void pollFlightRecorderAutosave() }, FLIGHT_RECORDER_AUTOSAVE_POLL_MS)
 }
@@ -4114,3 +4234,8 @@ function renderHorizontalHistogram(container, data = []) {
         container.append(row)
     })
 }
+
+// The view is chosen as the script runs, before the page first paints, not at load. Otherwise the History page showed the dashboard
+// until load finished, and the spinner only after that (5 Nov). init() applies it again, which changes nothing.
+// The test harness loads this file with no page, so the call waits for a body.
+if(globalThis.document?.body) applyCoordinatorViewMode()

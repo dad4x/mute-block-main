@@ -202,6 +202,29 @@ function getDefaultBaseUrl() {
 const normalizedProfileHrefMemo = new Map()
 const NORMALIZED_PROFILE_HREF_MEMO_LIMIT = 4000
 
+// The one form of a Quora question address (6 Nov). Quora links the same question as its own address and as a redirect form with the
+// address in the path (/https-www-quora-com-<slug>). Both become https://www.quora.com/<slug>. The page's collection and the worker's
+// requested-address keys both call this, so a question is one key wherever it is seen. A profile address is not a question: null.
+function normalizeQuoraQuestionHref(value = '') {
+    const text = `${value || ''}`.trim()
+    if (!text) return null
+    try {
+        const url = new URL(text, 'https://www.quora.com')
+        const host = `${url.hostname || ''}`.toLowerCase()
+        if (!(host === 'quora.com' || host.endsWith('.quora.com'))) return null
+        if (url.pathname.toLowerCase().startsWith('/profile/')) return null
+        const path = url.pathname
+            .replace(/^\/https-www-quora-com-/i, '/')
+            .replace(/\/+$/, '')
+            .replace(/\/log$/i, '')
+        if (!path || path === '/') return null
+        return `https://www.quora.com${path}`
+    }
+    catch {
+        return null
+    }
+}
+
 function normalizeQuoraProfileHref(href, baseUrl = getDefaultBaseUrl()) {
     if(!href) return null
 
@@ -346,6 +369,7 @@ function storedProfileHref(value = '') {
 
 module.exports = {
     QUORA_NON_PROFILE_ROOT_PATHS,
+    normalizeQuoraQuestionHref,
     storedProfileHref,
     getLikelyQuoraProfileSlug,
     isLikelyExplicitProfileTargetHref,

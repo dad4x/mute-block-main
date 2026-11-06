@@ -70,11 +70,22 @@ body {
     width: 40px;
 }
 
+/* The Quora wordmark link on the dashboard and history headers, the same red as Quora's own pages (4 Nov). */
+/* The right side of a page header: the "Return to Quora" line sits above the buttons row (4 Nov). */
 .header-status {
+    align-items: flex-end;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    gap: 8px;
+}
+
+.header-buttons {
     align-items: center;
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
-    flex-shrink: 0;
+    justify-content: flex-end;
 }
 
 h1,
@@ -409,6 +420,25 @@ h2 {
 
 .clear-button--flash {
     animation: button-flash 650ms ease-out;
+}
+
+/* Every extension button flashes once when pressed (6 Nov). Nuke 'Em has its own double flash and is not given this one. */
+.mb-button-press-flash {
+    animation: mb-button-press-flash var(--mb-button-press-flash-ms) ease-out;
+}
+
+@keyframes mb-button-press-flash {
+    0% {
+        filter: invert(0);
+    }
+
+    30% {
+        filter: invert(1);
+    }
+
+    100% {
+        filter: invert(0);
+    }
 }
 
 .work-session {
@@ -1091,6 +1121,28 @@ a.row-subtitle:hover {
 
 .worker-bar-button:hover {
     background: var(--mb-grey-50);
+}
+
+/* Every Pause and Resume is the black pill (5 Nov), wherever it sits on these pages. */
+.pause-toggle,
+.worker-bar-button.pause-toggle,
+.clear-button.pause-toggle {
+    background: var(--mb-black);
+    border: 1px solid var(--mb-black);
+    border-radius: 999px;
+    color: var(--mb-white);
+}
+
+.pause-toggle:hover:not(:disabled),
+.worker-bar-button.pause-toggle:hover,
+.clear-button.pause-toggle:hover {
+    background: var(--mb-grey-800);
+    border-color: var(--mb-grey-800);
+}
+
+/* The Current Work Pause/Resume is hidden: the progress bar and the History page carry it now (5 Nov). */
+#pauseCurrentWorkButton[hidden] {
+    display: none;
 }
 
 .worker-bar-button--danger {

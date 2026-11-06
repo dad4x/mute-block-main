@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard</title>
         <link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/quora-return.css">
 <link rel="stylesheet" href="css/coordinator.css">
 </head>
 <body>
@@ -15,11 +16,12 @@
             <div class="brand">
                 <img class="brand-mark" src="icons/116.png" alt="" aria-hidden="true">
                 <div>
-                    <h1>History</h1>
+                    <h1>Mute Block History</h1>
+                    <div class="version" id="historyVersion">v0.0.0</div>
                     <div class="history-controls">
                         <select class="select" id="historySort" title="Mute Block extension: Order the history rows">
                             <option value="newest">Newest first</option>
-                            <option value="status">By status (errors first)</option>
+                            <option value="status">Errors first, then other</option>
                         </select>
                         <input class="history-filter" id="historyFilter" type="text" placeholder="Filter history" aria-label="Filter history" title="Mute Block extension: Show only the rows that contain every word typed, in any order, in the profile, status, outcome, source or error text (not case-sensitive)" autocomplete="off">
                         <label class="history-dedupe" for="historyDedupe" title="Mute Block extension: Show only the most recent row for each profile (by completion time). Rows with no profile are each kept.">
@@ -31,9 +33,12 @@
                 </div>
             </div>
             <div class="header-status">
-                <button class="clear-button clear-button--danger" id="clearHistoryButton" type="button" title="Mute Block extension: Delete all completed history. Queued and active rows are not affected.">Clear</button>
-                <button class="clear-button" id="historyDashboardButton" type="button" title="Mute Block extension: Open the dashboard">Dashboard</button>
-                <button class="clear-button" id="historyPreferencesButton" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
+                <div class="quora-return">Return to <a class="quora-home-link" href="https://www.quora.com" target="_blank" rel="noopener" title="Mute Block extension: Open quora.com">Quora</a></div>
+                <div class="header-buttons">
+                    <button class="clear-button clear-button--danger" id="clearHistoryButton" type="button" title="Mute Block extension: Delete all completed history. Queued and active rows are not affected.">Clear</button>
+                    <button class="clear-button" id="historyDashboardButton" type="button" title="Mute Block extension: Open the dashboard">Dashboard</button>
+                    <button class="clear-button" id="historyPreferencesButton" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
+                </div>
             </div>
         </header>
         <section class="panel-stack" aria-label="Nuked post history">
@@ -49,16 +54,18 @@
         <span class="loading-indicator" role="status" aria-live="polite"><span class="loading-spinner" aria-hidden="true"></span><span class="loading-text">Loading…</span></span>
     </template>
 
-    <main class="coordinator" id="dashboardView">
+    <main class="coordinator" id="dashboardView" hidden>
         <header class="coordinator-header">
             <div class="brand">
                 <img class="brand-mark" src="icons/116.png" alt="" aria-hidden="true">
                 <div>
-                    <h1>Dashboard</h1>
+                    <h1>Mute Block Dashboard</h1>
                     <div class="version" id="appVersion">v0.0.0</div>
                 </div>
             </div>
             <div class="header-status">
+                <div class="quora-return">Return to <a class="quora-home-link" href="https://www.quora.com" target="_blank" rel="noopener" title="Mute Block extension: Open quora.com">Quora</a></div>
+                <div class="header-buttons">
                 <label class="dev-mode-toggle" title="Mute Block extension: Show internal metrics, scan cost, event counts, outliers, runs, and events panels">
                     <input type="checkbox" id="devModeToggle">
                     <span class="dev-mode-toggle-track"><span class="dev-mode-toggle-thumb"></span></span>
@@ -68,6 +75,7 @@
                 <button class="clear-button" id="openHistoryButton" type="button" title="Mute Block extension: Open the history page">History</button>
                 <button class="clear-button" id="openPreferencesButton" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
                 <div class="status-pill" id="refreshState">Loading</div>
+                </div>
             </div>
         </header>
 
@@ -86,7 +94,7 @@
                             <span class="queue-count" id="queueCount" hidden>0 jobs</span>
                             <div class="panel-action-buttons">
                                 <button class="clear-button" id="startCoordinatorButton" type="button" hidden title="Mute Block extension: Start the queue with its saved rows">Start</button>
-                                <button class="clear-button" id="pauseCurrentWorkButton" type="button" disabled title="Mute Block extension: Pause the current work, or resume it">Loading...</button>
+                                <button class="clear-button" id="pauseCurrentWorkButton" type="button" disabled hidden title="Mute Block extension: Pause the current work, or resume it">Loading...</button>
                                 <button class="clear-button clear-button--danger" id="clearCurrentWorkButton" type="button" title="Mute Block extension: Cancel and remove all Current Work rows">Clear</button>
                             </div>
                         </div>

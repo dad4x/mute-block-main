@@ -43962,6 +43962,8 @@ function loadListPageHarness() {
             }
             // The dashboard's footer bar is built by this module; the list-page harness does not draw it.
             if(name === './queueProgressBar') return {createQueueProgressBar: () => ({bar: {style: {}}, setProgress() {}})}
+            // The queue-bar summary reader and the button-press listener (6 Nov).
+            if(name === './swQueueBarSummary' || name === './buttonPressEvents' || name === './extensionPages' || name === './queueBottomBar') return sharedModule(name.slice(2))
             throw new Error(`unexpected require in coordinator.js: ${name}`)
         },
         document: {
@@ -44126,6 +44128,16 @@ test('the Current Work list holds only the live rows, in the order the worker ga
     const listed = listPlainCopy(refreshed.view.items)
     assert.deepEqual(listed.map(item => item.storageKey), LIST_GOLDEN_LIVE_KEYS, 'the list is exactly the live rows, in the order they had before the change')
     assert.equal(listDigest(listed), LIST_GOLDEN_LIVE_ITEMS_DIGEST, 'each listed row keeps the shape and values it had before the change')
+})
+
+test('a polled refresh lists only the head of the queue (at most the poll head limit); the counts still cover every row (owner, 5 Nov)', async () => {
+    const {DASHBOARD_QUEUE_POLL_HEAD_LIMIT} = require('../shared/js/tunables')
+    const harness = await startListFixtureHarness(buildListFixture())
+    const polled = await harness.browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'dashboard-poll', listLimit: DASHBOARD_QUEUE_POLL_HEAD_LIMIT})
+    assert.deepEqual(listPlainCopy(polled.view.items).map(item => item.storageKey), LIST_GOLDEN_LIVE_KEYS.slice(0, DASHBOARD_QUEUE_POLL_HEAD_LIMIT), 'the poll lists the first live rows in queue order')
+    assert.equal(polled.view.truncated, LIST_GOLDEN_LIVE_KEYS.length > DASHBOARD_QUEUE_POLL_HEAD_LIMIT, 'a capped poll says it is truncated')
+    assert.equal(polled.view.total, LIST_GOLDEN_TOTAL, 'the total still counts every row')
+    assert.deepEqual(listPlainCopy(polled.view.counts), LIST_GOLDEN_COUNTS, 'the status counts still cover every row')
 })
 
 test('the view total and status counts are built from every compact row, finished rows included, so the progress bar still counts them', async () => {
@@ -46053,6 +46065,13 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         collectPassMadeProgress: require('../shared/js/candidateCollect').collectPassMadeProgress,
         reportCollectEnd: () => {},
         formatCollectStopLabel: require('../shared/js/candidateCollect').formatCollectStopLabel,
+        formatCollectEndNotice: require('../shared/js/candidateCollect').formatCollectEndNotice,
+        // The collect result under the button is a page detail; these collect tests only check the collect (5 Nov).
+        setCollectResult: (element, reason) => { notices.push(reason) },
+        clearCollectResult: () => {},
+        // The Nuke button gate is a page-side detail; the collect tests here only check the collect (4 Nov).
+        setSpaceFeedNukeCollectGate: () => {},
+        syncSpaceFeedNukeControls: () => {},
         STOP_COLLECT_LABEL_TEXT: require('../shared/js/candidateCollect').STOP_COLLECT_LABEL_TEXT,
         COLLECT_STOP_LABEL_TICK_MS: require('../shared/js/tunables').COLLECT_STOP_LABEL_TICK_MS,
         setInterval: fn => { state.tick = fn; state.timersStarted += 1; return state.timersStarted },
@@ -46134,6 +46153,13 @@ function makeSearchCollectHarness(stopOnPass = 0) {
         // The end event is recorded so a test can read the detail (considered, the count of distinct result rows).
         reportCollectEnd: (page, detail) => { reports.push({page, ...detail}) },
         formatCollectStopLabel: require('../shared/js/candidateCollect').formatCollectStopLabel,
+        formatCollectEndNotice: require('../shared/js/candidateCollect').formatCollectEndNotice,
+        // The collect result under the button is a page detail; these collect tests only check the collect (5 Nov).
+        setCollectResult: (element, reason) => { notices.push(reason) },
+        clearCollectResult: () => {},
+        // The Nuke button gate is a page-side detail; the collect tests here only check the collect (4 Nov).
+        setSpaceFeedNukeCollectGate: () => {},
+        syncSpaceFeedNukeControls: () => {},
         STOP_COLLECT_LABEL_TEXT: require('../shared/js/candidateCollect').STOP_COLLECT_LABEL_TEXT,
         COLLECT_STOP_LABEL_TICK_MS: require('../shared/js/tunables').COLLECT_STOP_LABEL_TICK_MS,
         setInterval: fn => { state.tick = fn; state.timersStarted += 1; return state.timersStarted },

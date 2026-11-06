@@ -22,6 +22,16 @@
     --mb-brand-red-dark: #a82723;
     --mb-brand-red-darker: #8f201d;
     --mb-brand-red-tint: #fce8e7;
+    /* Space categories (6 Nov): one set of colours for Asset, Target and Neutral. The Quora space page and the preferences page both use these. */
+    --mb-category-asset: var(--mb-green-700);
+    --mb-category-asset-tint: var(--mb-green-50);
+    --mb-category-target: var(--mb-brand-red);
+    --mb-category-target-tint: var(--mb-brand-red-tint);
+    --mb-category-target-text: var(--mb-brand-red-darker);
+    --mb-category-neutral: var(--mb-grey-500);
+    --mb-category-neutral-tint: var(--mb-grey-200);
+    /* How long a single button flash lasts (6 Nov). The stylesheets and the press listener both read this one value. */
+    --mb-button-press-flash-ms: 300ms;
 
     --mb-indigo-50: #eef2ff;
     --mb-indigo-400: #818cf8;
@@ -40,6 +50,7 @@
     --mb-green-100: #dcfce7;
     --mb-green-300: #86efac;
     --mb-green-500: #22c55e;
+    --mb-green-700: #176a43;
     --mb-green-800: #166534;
     --mb-red-50: #fef2f2;
     --mb-red-200: #fecaca;

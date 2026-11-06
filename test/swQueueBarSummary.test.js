@@ -49,7 +49,7 @@ test('recording reports a change only when total or pending moves, not when upda
 
 test('the bar is shown while work is queued and the queue is not paused, and hidden when nothing is queued (decision 13)', () => {
     assert.equal(getQueueBarDisplay({total: 5, pending: 3}, false).visible, true)
-    assert.equal(getQueueBarDisplay({total: 5, pending: 3}, true).visible, false, 'paused hides the bar')
+    assert.equal(getQueueBarDisplay({total: 5, pending: 3}, true).visible, true, 'paused keeps the bar: work is still queued')
     assert.equal(getQueueBarDisplay({total: 5, pending: 0}, false).visible, false, 'done hides the bar')
     assert.equal(getQueueBarDisplay({total: 0, pending: 0}, false).visible, false, 'nothing queued hides the bar')
     assert.equal(getQueueBarDisplay(null, false).visible, false, 'a failed read or no summary hides the bar')
@@ -142,6 +142,8 @@ async function runContentRefresh({reply = null, paused = false, pushedSummary = 
         getQueueBarDisplay,
         getOrCreateContentProgressBar: () => { calls.bar += 1; return bar },
         removeContentProgressBar: () => { calls.removed += 1 },
+        // The Pause/Resume label is set from the same read (4 Nov); this harness only checks the bar's fill and count.
+        syncContentProgressBarPauseResume: () => {},
         // The Nuking drop-down takes the stored pause flag from the same read (28 Oct); this harness only checks the bar.
         setNukingQueuePaused: () => {},
         browser: {
@@ -173,12 +175,13 @@ test('the content bar shows the summary the worker answers: 0/total while queued
     assert.equal(zeroOfTotal.width, '0%')
 })
 
-test('the content bar is hidden when the request fails, the queue is paused, nothing is queued, or the batch is done', async () => {
+test('the content bar is hidden when the request fails, nothing is queued, or the batch is done; a paused queue with work keeps it (4 Nov)', async () => {
     const failed = await runContentRefresh({reply: new Error('no receiver')})
     assert.equal(failed.removed, 1, 'a failed request hides the bar')
     assert.equal(failed.bar, 0)
     const paused = await runContentRefresh({reply: {summary: {total: 4, pending: 3, updatedAt: 1}}, paused: true})
-    assert.equal(paused.removed, 1)
+    assert.equal(paused.removed, 0, 'paused with work stays')
+    assert.equal(paused.bar, 1)
     const empty = await runContentRefresh({reply: {summary: {total: 0, pending: 0, updatedAt: 1}}})
     assert.equal(empty.removed, 1)
     const done = await runContentRefresh({reply: {summary: {total: 4, pending: 0, updatedAt: 1}}})

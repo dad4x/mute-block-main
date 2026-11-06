@@ -78,7 +78,8 @@ test('question rows are found by their question component, and resolve the poste
     const rowBody = extractFunction(source, 'function getSpaceFeedQuestionRow(link) {')
     assert.match(rowBody, /puppeteer_test_question_component/)
     const entriesBody = extractFunction(source, 'function getSpaceFeedQuestionRowEntries() {')
-    assert.match(entriesBody, /resolutionUrl: `\$\{submissionUrl\}\/log`/)
+    assert.match(entriesBody, /const submissionUrl = questionUrl \? `\$\{questionUrl\}\/log` : null/, 'the question address is the one shared question form, with /log')
+    assert.match(entriesBody, /resolutionUrl: submissionUrl,/, 'the chase address is that same question address')
     assert.match(entriesBody, /resolutionSubject: RESOLUTION_SUBJECT_POSTER/)
 })
 

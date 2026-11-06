@@ -27,6 +27,8 @@ module.exports = {
     // only once the import has run. The 1.5 registry itself is read under its plain name SPACE_REGISTRY_KEY, outside this layout.
     SPACE_REGISTRY_IMPORT_MARKER_KEY: 'mbSpaceRegistryImportedFromV15',
     DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled',
+    // The flight recorder's Save-every setting (0 or 50), kept with the dev-mode flag so it survives a dashboard reload (4 Nov).
+    FLIGHT_RECORDER_AUTOSAVE_KEY: 'mbDashboardFlightRecorderAutosaveEvery',
     // The last or current continuous work: its start, and its end once it has ended (24 Oct). Read by the dashboard's Current Work header.
     COORDINATOR_WORK_SESSION_KEY: 'mbCoordinatorWorkSession',
     // The build that last ran against this storage: the running manifest version (for example 1.6.1626). The worker checks it at install

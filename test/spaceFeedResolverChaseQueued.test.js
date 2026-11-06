@@ -25,8 +25,11 @@ const context = vm.createContext({
     pendingSpaceFeedIndexCache: {queue: null, index: null},
     spaceFeedEnqueueMarks: {batches: () => []},
     isPendingCoordinatorStatus: status => ['queued', 'opening', 'active', 'acting', 'settling'].includes(status),
-    getCoordinatorItemProfileHref: (key, item) => (item && item.targetProfileHref) || ''
+    getCoordinatorItemProfileHref: (key, item) => (item && item.targetProfileHref) || '',
+    normalizeQuoraPostHref: href => (href ? String(href).replace(/\/$/, '') : null),
+    normalizeQuoraQuestionHref: () => null
 })
+vm.runInContext(extractFunction(source, "function normalizeSpaceFeedChaseUrl(url = '')"), context)
 vm.runInContext(extractFunction(source, 'function getPendingSpaceFeedIndex() {'), context)
 vm.runInContext(extractFunction(source, 'function isSpaceFeedResolverChaseQueued(entry = null) {'), context)
 

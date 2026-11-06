@@ -5,22 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Preferences</title>
         <link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/quora-return.css">
 <link rel="stylesheet" href="css/popup.css">
 </head>
 <body>
     <main class="popup">
         <header class="header">
-            <div class="header-main">
-                <span class="header-title" id="appName">Mute Block</span>
-                <span class="header-version" id="appVersion">v0.0.0</span>
+            <div class="header-brand">
+                <img class="header-logo" src="icons/32.png" alt="" aria-hidden="true">
+                <div class="header-main">
+                    <span class="header-title" id="appName">Mute Block Preferences</span>
+                    <span class="header-subhead" id="appVersion">v0.0.0</span>
+                </div>
+            </div>
+            <div class="header-status">
+                <div class="quora-return">Return to <a class="quora-home-link" href="https://www.quora.com" target="_blank" rel="noopener" title="Mute Block extension: Open quora.com">Quora</a></div>
+                <div class="header-buttons">
+                    <button class="clear-button" id="openCoordinator" type="button" title="Mute Block extension: Open the dashboard">Dashboard</button>
+                    <button class="clear-button" id="openHistory" type="button" title="Mute Block extension: Open the history page">History</button>
+                    <button class="clear-button pause-toggle" type="submit" form="settingsForm" title="Mute Block extension: Save these preferences">Save Preferences</button>
+                    <button class="clear-button" type="reset" form="settingsForm" title="Mute Block extension: Reset every setting to its default and save it">Reset to Defaults</button>
+                </div>
             </div>
             <button class="header-close" id="closePopup" type="button" aria-label="Close popup" title="Mute Block extension: Close this page">X</button>
         </header>
-
-        <div class="top-actions">
-            <button class="button button-primary" id="openCoordinator" type="button" title="Mute Block extension: Open the dashboard">Open Dashboard</button>
-            <button class="button button-secondary" id="openHistory" type="button" title="Mute Block extension: Open the history page">Open History</button>
-        </div>
 
         <form class="form" id="settingsForm">
             <section class="section">
@@ -106,11 +114,6 @@
                     <input class="input" id="maxRememberedNukedPosts" type="number" min="0" required>
                 </div>
             </section>
-
-            <div class="actions">
-                <button class="button button-primary" type="submit" title="Mute Block extension: Save these preferences">Save Preferences</button>
-                <button class="button button-secondary" type="reset" title="Mute Block extension: Reset every setting to its default and save it">Reset to Defaults</button>
-            </div>
 
             <div class="status" id="status" hidden></div>
         </form>

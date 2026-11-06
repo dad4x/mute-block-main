@@ -52,15 +52,15 @@ function getQueueBarSummary() {
     return currentQueueBarSummary ? {...currentQueueBarSummary} : null
 }
 
-// The bar's display for a summary (decision 13, 18 Oct). It is shown while work is queued and the queue is not paused, from 0/total
-// up. It is hidden when nothing is queued (pending 0 or total 0), when the batch is done, or when the queue is paused. A missing
-// summary (the read failed, or none has been recorded) shows nothing.
+// The bar's display for a summary. The rule (owner, 4 Nov): the bar is there while there is work to be done and vanishes when the queue
+// is empty. A paused queue still has work, so the bar stays and offers Resume. A missing summary (the read failed, or none has been
+// recorded) shows nothing.
 function getQueueBarDisplay(summary = null, paused = false) {
     const total = Number.parseInt(summary?.total, 10) || 0
     const pending = Number.parseInt(summary?.pending, 10) || 0
     const terminal = Math.max(0, total - pending)
     return {
-        visible: !paused && total > 0 && pending > 0,
+        visible: total > 0 && pending > 0,
         total,
         terminal,
         percent: total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0

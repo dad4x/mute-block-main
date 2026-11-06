@@ -1,7 +1,11 @@
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
 const {namespaceArea, namespaceChanges} = require('./storageNamespace')
+const {installButtonPressListener} = require('./buttonPressEvents')
 const { setMuteBlockHelp } = require('./muteBlockHelp')
+const {createQueueBottomBar, readStoredQueuePaused, refreshQueueBarFromSummary, sendQueuePauseRequest} = require('./queueBottomBar')
+const {QUEUE_BAR_PAGE_POLL_MS} = require('./tunables')
+const {openExtensionPageFromHere} = require('./extensionPages')
 const {
     MAX_REMEMBERED_NUKED_POSTS_KEY,
     NUKED_POST_RETENTION_DAYS_KEY,
@@ -28,7 +32,46 @@ const popupState = {
 
 addEventListener('load', init)
 
+// A page open, recorded in the worker's recorder with its timing (6 Nov). Not on the open's path.
+function reportPreferencesPageOpen(detail) {
+    void browser.runtime.sendMessage({action: 'record-page-event', event: 'page-open', detail: `preferences ${detail}`, clientAt: Date.now()}).catch(() => null)
+}
+
+// The one bottom bar every page uses (queueBottomBar.js, 6 Nov). This page has no queue view, so its numbers come from the worker's
+// queue-bar summary, and its Pause and Resume go through the same request the dashboard sends.
+let queueBottomBar = null
+
+function installPreferencesQueueBar() {
+    queueBottomBar = createQueueBottomBar({
+        onLogoClick: () => { void openExtensionPageFromHere(browser, {page: 'dashboard', clickedAt: Date.now(), report: reportPreferencesPageOpen}) },
+        onPauseClick: () => { void togglePreferencesQueuePause() }
+    })
+}
+
+async function refreshPreferencesQueueBar() {
+    if(!queueBottomBar) return
+    await refreshQueueBarFromSummary(queueBottomBar, browser)
+}
+
+async function togglePreferencesQueuePause() {
+    const paused = await readStoredQueuePaused(browser)
+    queueBottomBar.setPending(paused ? 'resume' : 'pause')
+    await sendQueuePauseRequest(browser, paused)
+    queueBottomBar.setPending('')
+    await refreshPreferencesQueueBar()
+}
+
 async function init() {
+    // Every press on this page's buttons is recorded in the flight recorder and flashed once (6 Nov).
+    installButtonPressListener({
+        report: label => void browser.runtime.sendMessage({action: 'record-page-event', event: 'button-press', detail: `preferences ${label}`, clientAt: Date.now()}).catch(() => null)
+    })
+    installPreferencesQueueBar()
+    void refreshPreferencesQueueBar()
+    setInterval(() => {
+        if(document.hidden) return
+        void refreshPreferencesQueueBar()
+    }, QUEUE_BAR_PAGE_POLL_MS)
     const manifest = browser.runtime.getManifest()
     const settings = await namespaceArea(browser.storage.local).get({
         ...defaults,
@@ -36,7 +79,6 @@ async function init() {
         [SPACE_SORT_KEY]: SPACE_SORT_NAME
     })
 
-    document.getElementById('appName').textContent = manifest.name
     document.getElementById('appVersion').textContent = `v${manifest.version}`
     document.getElementById('closePopup').addEventListener('click', () => window.close())
 
@@ -128,31 +170,15 @@ async function init() {
         void updateSpaceCategory(button.dataset.spaceKey, button.dataset.category, spaceList)
     })
 
+    // The dashboard opens from this page, in the window the button was pressed in, with no trip through the worker (6 Nov).
     openCoordinator?.addEventListener('click', async () => {
-        // The popup isn't a tab, so the service worker's message sender has
-        // no sender.tab.windowId to fall back on -- send our own window id
-        // explicitly so the dashboard opens/moves to the window this button
-        // was actually pressed in, rather than wherever an existing
-        // dashboard tab happens to already be.
-        const currentWindow = await browser.windows.getCurrent().catch(() => null)
-        const result = await browser.runtime.sendMessage({
-            action: 'open-coordinator',
-            active: true,
-            windowId: currentWindow?.id || null
-        }).catch(error => ({error: error?.message || `${error || ''}`}))
-
-        showStatus(status, result?.error ? 'Dashboard open failed.' : 'Dashboard opened.')
+        const result = await openExtensionPageFromHere(browser, {page: 'dashboard', clickedAt: Date.now(), report: reportPreferencesPageOpen}).catch(error => ({error: error?.message || `${error || ''}`}))
+        showStatus(status, result?.tabId ? 'Dashboard opened.' : 'Dashboard open failed.')
     })
 
     openHistory?.addEventListener('click', async () => {
-        const currentWindow = await browser.windows.getCurrent().catch(() => null)
-        const result = await browser.runtime.sendMessage({
-            action: 'open-coordinator-history',
-            active: true,
-            windowId: currentWindow?.id || null
-        }).catch(error => ({error: error?.message || `${error || ''}`}))
-
-        showStatus(status, result?.error ? 'History open failed.' : 'History opened.')
+        const result = await openExtensionPageFromHere(browser, {page: 'history', clickedAt: Date.now(), report: reportPreferencesPageOpen}).catch(error => ({error: error?.message || `${error || ''}`}))
+        showStatus(status, result?.tabId ? 'History opened.' : 'History open failed.')
     })
 
     browser.storage.onChanged.addListener(storedChanges => {

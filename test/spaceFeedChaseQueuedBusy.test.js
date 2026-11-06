@@ -46,6 +46,7 @@ function loadHarness(queuedChases = []) {
     vm.runInContext([
         'const SPACE_FEED_POST_NUKE_MIN_PROFILES = 1',
         `function normalizeQuoraPostHref(href = '') { return href || null }`,
+        `function normalizeQuoraQuestionHref(value = '') { return null }`,
         `function getNormalizedProfileHrefList(urls = []) { return Array.isArray(urls) ? [...new Set(urls)] : [] }`,
         `function isSpaceFeedEntryNukedForRender() { return false }`,
         `function getActivePendingSpaceFeedUrlsForRender() { return [] }`,
@@ -56,6 +57,7 @@ function loadHarness(queuedChases = []) {
         `function isSpaceFeedPostNuking() { return false }`,
         `function isSpaceFeedPostPendingForRender() { return false }`,
         extractFunction(source, 'function isResolvableSpaceFeedEntry(entry)'),
+        extractFunction(source, "function normalizeSpaceFeedChaseUrl(url = '')"),
         extractFunction(source, 'function isSpaceFeedResolverChaseQueued(entry = null)'),
         extractFunction(source, 'function buildSpaceFeedRenderEntry(entry = null, context = null)')
     ].join('\n\n'), context, {filename: 'space-feed-chase-queued-busy-harness.js'})
