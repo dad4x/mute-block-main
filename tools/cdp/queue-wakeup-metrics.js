@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+const {QUEUE_WAKEUP_METRICS_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
 const fs = require('fs')
 const {
     evaluate,
@@ -9,7 +11,8 @@ const {
     runMain
 } = require('./lib/cdp')
 
-const METRICS_KEY = 'mbQueueWakeupMetrics'
+// The stored name of the metrics: the layout prefix plus the plain key name (storageNamespace.js).
+const METRICS_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${QUEUE_WAKEUP_METRICS_KEY}`
 
 function asNumber(value) {
     const number = Number(value) || 0
@@ -333,7 +336,7 @@ async function readLiveMetrics() {
                 })
             }
         })
-    }})(${JSON.stringify(METRICS_KEY)})`, 10000).catch(error => ({
+    }})(${JSON.stringify(METRICS_STORED_KEY)})`, 10000).catch(error => ({
             timedOut: true,
             lastError: error.message,
             metrics: null

@@ -1,0 +1,2074 @@
+file	line	value	concept	name	callee	kind	op	declared_top_level	central	group
+shared/js/content.js	98	3	count	SPACE_FEED_PROFILES_PER_BATCH		decl		yes	no	shared
+shared/js/content.js	99	3	count	MODAL_PROFILE_NUKE_PROFILES_PER_BATCH		decl		yes	no	shared
+shared/js/content.js	100	3	count	PROFILE_SEARCH_PROFILES_PER_BATCH		decl		yes	no	shared
+shared/js/content.js	101	100	count	PROFILE_SEARCH_COLLECT_LIMIT		decl		yes	no	shared
+shared/js/content.js	102	120	count	PROFILE_SEARCH_COLLECT_MAX_SCROLL_PASSES		decl		yes	no	shared
+shared/js/content.js	103	30000	time	PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS		decl		yes	no	shared
+shared/js/content.js	112	2	size	slice	slice	arg		no	no	shared
+shared/js/content.js	112	8	size	slice	slice	arg		no	no	shared
+shared/js/content.js	113	2500	time	QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/content.js	114	5000	time	QUEUED_TERMINAL_PROGRESS_MESSAGE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/content.js	115	3	count	QUEUED_TERMINAL_PROGRESS_MESSAGE_ATTEMPTS		decl		yes	no	shared
+shared/js/content.js	116	250	time	QUEUED_TERMINAL_PROGRESS_RETRY_DELAY_MS		decl		yes	no	shared
+shared/js/content.js	117	6000	time	QUEUED_ACTION_CLAIM_MESSAGE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/content.js	118	500	time	QUEUED_ACTION_CLAIM_FAST_RETRY_DELAY_MS		decl		yes	no	shared
+shared/js/content.js	119	5000	time	QUEUED_ACTION_CLAIM_SLOW_RETRY_DELAY_MS		decl		yes	no	shared
+shared/js/content.js	120	6	count	QUEUED_ACTION_CLAIM_FAST_ATTEMPTS		decl		yes	no	shared
+shared/js/content.js	121	2000	time	QUEUED_ACTION_CLAIM_RESCUE_INTERVAL_MS		decl		yes	no	shared
+shared/js/content.js	122	1000	other	(top)		array		no	no	shared
+shared/js/content.js	122	5000	other	(top)		array		no	no	shared
+shared/js/content.js	122	15000	other	(top)		array		no	no	shared
+shared/js/content.js	123	5000	time	QUEUED_PROFILE_RESOLUTION_MESSAGE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/content.js	124	3	count	QUEUED_PROFILE_RESOLUTION_MESSAGE_ATTEMPTS		decl		yes	no	shared
+shared/js/content.js	125	350	time	QUEUED_PROFILE_RESOLUTION_RETRY_DELAY_MS		decl		yes	no	shared
+shared/js/content.js	126	5000	time	QUEUED_ACTION_HEARTBEAT_MS		decl		yes	no	shared
+shared/js/content.js	127	1000	time	CONTENT_PAGE_STATE_REFRESH_MIN_INTERVAL_MS		decl		yes	no	shared
+shared/js/content.js	128	2000	time	PROFILE_SEARCH_PENDING_REFRESH_MS		decl		yes	no	shared
+shared/js/content.js	129	3500	time	HIDDEN_PROFILE_READY_FAST_PROBE_MS		decl		yes	no	shared
+shared/js/content.js	130	12000	time	HIDDEN_PROFILE_READY_NO_FOREGROUND_MS		decl		yes	no	shared
+shared/js/content.js	131	25000	time	VISIBLE_PROFILE_READY_MS		decl		yes	no	shared
+shared/js/content.js	141	6	time	PROFILE_BUTTONS_REFRESH_BURST_LIMIT		decl		yes	no	shared
+shared/js/content.js	142	3000	time	PROFILE_BUTTONS_REFRESH_BURST_WINDOW_MS		decl		yes	no	shared
+shared/js/content.js	211	500	time	scheduleCurrentProfilePendingClaimRescue	scheduleCurrentProfilePendingClaimRescue	arg		no	no	shared
+shared/js/content.js	313	2	count	SPACE_POST_NUKE_MIN_PROFILES		decl		yes	no	shared
+shared/js/content.js	321	12000	time	STALE_PROFILE_NUKE_PROGRESS_MS		decl		yes	no	shared
+shared/js/content.js	322	450	time	SPACE_FEED_SCROLL_IDLE_MS		decl		yes	no	shared
+shared/js/content.js	323	120	time	SPACE_FEED_SCROLL_REFRESH_GRACE_MS		decl		yes	no	shared
+shared/js/content.js	324	320	time	SPACE_FEED_PROGRESS_REFRESH_IDLE_MS		decl		yes	no	shared
+shared/js/content.js	325	1800	count	SPACE_FEED_SCAN_VIEWPORT_MARGIN_PX		decl		yes	no	shared
+shared/js/content.js	326	320	count	SPACE_FEED_SCAN_ABOVE_VIEWPORT_MARGIN_PX		decl		yes	no	shared
+shared/js/content.js	327	60	count	SPACE_FEED_SCAN_MAX_TIMESTAMPS		decl		yes	no	shared
+shared/js/content.js	328	160	count	SPACE_FEED_SCAN_FALLBACK_MAX_CANDIDATES		decl		yes	no	shared
+shared/js/content.js	329	140	count	SPACE_FEED_SCAN_SAMPLE_STEP_PX		decl		yes	no	shared
+shared/js/content.js	330	0.28	other	(top)		array		no	no	shared
+shared/js/content.js	330	0.5	other	(top)		array		no	no	shared
+shared/js/content.js	330	0.72	other	(top)		array		no	no	shared
+shared/js/content.js	331	80	count	MODAL_PROFILE_NUKE_MAX_SCROLL_PASSES		decl		yes	no	shared
+shared/js/content.js	332	4	count	MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES		decl		yes	no	shared
+shared/js/content.js	333	8000	time	FOREGROUND_PROMOTION_MESSAGE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/content.js	334	90000	time	FOREGROUND_PROMOTION_LEASE_WAIT_MS		decl		yes	no	shared
+shared/js/content.js	335	45000	time	ACTION_LEASE_WAIT_MS		decl		yes	no	shared
+shared/js/content.js	336	2500	time	ACTION_LEASE_POLL_MS		decl		yes	no	shared
+shared/js/content.js	381	5000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	381	25	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	462	200	other	activateSpacePageControls	activateSpacePageControls	arg		no	no	shared
+shared/js/content.js	465	350	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	468	200	time	scheduleProfileSearchControls	scheduleProfileSearchControls	arg		no	no	shared
+shared/js/content.js	528	250	size	slice	slice	arg		no	no	shared
+shared/js/content.js	613	3000	time	safeSendRuntimeMessageWithTimeout	safeSendRuntimeMessageWithTimeout	arg		no	no	shared
+shared/js/content.js	960	2500	time	safeSendRuntimeMessageWithTimeout	safeSendRuntimeMessageWithTimeout	arg		no	no	shared
+shared/js/content.js	1049	-12	count	mergeProfileProgressEvents		CallExpression		no	no	shared
+shared/js/content.js	1234	-12	other	normalizeProfileProgressPatch		CallExpression		no	no	shared
+shared/js/content.js	1362	4000	time	safeSendRuntimeMessageWithTimeout	safeSendRuntimeMessageWithTimeout	arg		no	no	shared
+shared/js/content.js	1492	80	size	slice	slice	arg		no	no	shared
+shared/js/content.js	1566	2500	time	safeSendRuntimeMessageWithTimeout	safeSendRuntimeMessageWithTimeout	arg		no	no	shared
+shared/js/content.js	1613	1200	other	readProfileMenuState	readProfileMenuState	arg		no	no	shared
+shared/js/content.js	1613	150	other	readProfileMenuState	readProfileMenuState	arg		no	no	shared
+shared/js/content.js	1661	1000	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	1662	2000	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	1671	1000	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	1756	100	count	SPACE_MARK_PERF_MAX_RECENT_EVENTS		decl		yes	no	shared
+shared/js/content.js	1790	2500	time	safeSendRuntimeMessageWithTimeout	safeSendRuntimeMessageWithTimeout	arg		no	no	shared
+shared/js/content.js	1948	4000	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	2010	300	time	scheduleSpacePostNukeBtn	scheduleSpacePostNukeBtn	arg		no	no	shared
+shared/js/content.js	2021	120	time	scheduleSpaceClassificationControls	scheduleSpaceClassificationControls	arg		no	no	shared
+shared/js/content.js	2028	180	time	scheduleSpaceAssetNukeControls	scheduleSpaceAssetNukeControls	arg		no	no	shared
+shared/js/content.js	2033	180	time	scheduleProfileSearchControls	scheduleProfileSearchControls	arg		no	no	shared
+shared/js/content.js	2054	1000	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	2068	160	time	scheduleProfileSearchControls	scheduleProfileSearchControls	arg		no	no	shared
+shared/js/content.js	2077	160	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	2083	220	time	scheduleProfileSearchControls	scheduleProfileSearchControls	arg		no	no	shared
+shared/js/content.js	2217	250	time	scheduleSpaceFeedProgressReconciliation	scheduleSpaceFeedProgressReconciliation	arg		no	no	shared
+shared/js/content.js	2221	800	other	(expr)		ternary		no	no	shared
+shared/js/content.js	2336	400	time	delay		default		no	no	shared
+shared/js/content.js	2353	400	other	scheduleProfileButtonsFollowUps		array		no	no	shared
+shared/js/content.js	2353	1000	other	scheduleProfileButtonsFollowUps		array		no	no	shared
+shared/js/content.js	2353	2000	other	scheduleProfileButtonsFollowUps		array		no	no	shared
+shared/js/content.js	2353	3500	other	scheduleProfileButtonsFollowUps		array		no	no	shared
+shared/js/content.js	2386	250	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	2391	20	other	trySync	trySync	arg		no	no	shared
+shared/js/content.js	2391	50	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	2498	1000	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	2514	2000	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	2582	750	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	2587	20	other	tryInject	tryInject	arg		no	no	shared
+shared/js/content.js	2609	1500	other	scheduleQuestionPageFollowUps		array		no	no	shared
+shared/js/content.js	2609	4000	other	scheduleQuestionPageFollowUps		array		no	no	shared
+shared/js/content.js	2609	8000	other	scheduleQuestionPageFollowUps		array		no	no	shared
+shared/js/content.js	2609	12000	other	scheduleQuestionPageFollowUps		array		no	no	shared
+shared/js/content.js	2633	800	other	scheduleSpacePostFollowUps		array		no	no	shared
+shared/js/content.js	2633	2000	other	scheduleSpacePostFollowUps		array		no	no	shared
+shared/js/content.js	2633	5000	other	scheduleSpacePostFollowUps		array		no	no	shared
+shared/js/content.js	2638	150	time	scheduleSpacePostNukeBtn	scheduleSpacePostNukeBtn	arg		no	no	shared
+shared/js/content.js	2654	180	time	assetDelay		default		no	no	shared
+shared/js/content.js	2669	800	other	scheduleSpacePageFollowUps		array		no	no	shared
+shared/js/content.js	2669	2000	other	scheduleSpacePageFollowUps		array		no	no	shared
+shared/js/content.js	2669	5000	other	scheduleSpacePageFollowUps		array		no	no	shared
+shared/js/content.js	2669	10000	other	scheduleSpacePageFollowUps		array		no	no	shared
+shared/js/content.js	2685	150	time	delay		default		no	no	shared
+shared/js/content.js	2769	2	size	slice	slice	arg		no	no	shared
+shared/js/content.js	2778	1800	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	2794	120	time	timeoutMs		prop		no	no	shared
+shared/js/content.js	2797	360	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	2802	16	size	max	max	arg		no	no	shared
+shared/js/content.js	2802	120	other	(expr)		logical		no	no	shared
+shared/js/content.js	2856	200	other	activateSpacePageControls	activateSpacePageControls	arg		no	no	shared
+shared/js/content.js	2910	150	time	delay		default		no	no	shared
+shared/js/content.js	2966	180	time	delay		default		no	no	shared
+shared/js/content.js	2971	40	other	spaceAssetNukeScheduledAt		binary	+	no	no	shared
+shared/js/content.js	2986	250	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	3319	4096	count	MAX_ELEMENT_TEXT_CHARS		decl		yes	no	shared
+shared/js/content.js	3330	32	other	code		binary	<=	no	no	shared
+shared/js/content.js	3330	160	other	code		binary	===	no	no	shared
+shared/js/content.js	3438	24	other	tolerance		default		no	no	shared
+shared/js/content.js	3461	2	count	length		binary	>=	no	no	shared
+shared/js/content.js	3498	1200	threshold	score		assign		no	no	shared
+shared/js/content.js	3499	800	threshold	score		assign		no	no	shared
+shared/js/content.js	3500	200	threshold	score		assign		no	no	shared
+shared/js/content.js	3501	2	count	length		binary	>=	no	no	shared
+shared/js/content.js	3501	240	threshold	score		assign		no	no	shared
+shared/js/content.js	3502	3	count	length		binary	>=	no	no	shared
+shared/js/content.js	3502	180	threshold	score		assign		no	no	shared
+shared/js/content.js	3503	220	threshold	score		assign		no	no	shared
+shared/js/content.js	3504	180	threshold	score		assign		no	no	shared
+shared/js/content.js	3505	120	threshold	score		assign		no	no	shared
+shared/js/content.js	3506	8	count	size		binary	<=	no	no	shared
+shared/js/content.js	3506	120	threshold	score		assign		no	no	shared
+shared/js/content.js	3507	90	other	(expr)		binary	*	no	no	shared
+shared/js/content.js	3511	260	count	topDistance		binary	<=	no	no	shared
+shared/js/content.js	3511	240	threshold	score		assign		no	no	shared
+shared/js/content.js	3512	420	count	topDistance		binary	<=	no	no	shared
+shared/js/content.js	3512	120	threshold	score		assign		no	no	shared
+shared/js/content.js	3513	600	size	min	min	arg		no	no	shared
+shared/js/content.js	3543	1200	threshold	score		assign		no	no	shared
+shared/js/content.js	3544	260	threshold	score		assign		no	no	shared
+shared/js/content.js	3545	420	threshold	score		assign		no	no	shared
+shared/js/content.js	3546	2	count	length		binary	>=	no	no	shared
+shared/js/content.js	3546	320	threshold	score		assign		no	no	shared
+shared/js/content.js	3547	180	threshold	score		assign		no	no	shared
+shared/js/content.js	3548	320	threshold	score		assign		no	no	shared
+shared/js/content.js	3549	260	threshold	score		assign		no	no	shared
+shared/js/content.js	3550	180	threshold	score		assign		no	no	shared
+shared/js/content.js	3551	8	count	size		binary	<=	no	no	shared
+shared/js/content.js	3551	120	threshold	score		assign		no	no	shared
+shared/js/content.js	3552	90	other	(expr)		binary	*	no	no	shared
+shared/js/content.js	3556	260	count	topDistance		binary	<=	no	no	shared
+shared/js/content.js	3556	320	threshold	score		assign		no	no	shared
+shared/js/content.js	3557	420	count	topDistance		binary	<=	no	no	shared
+shared/js/content.js	3557	160	threshold	score		assign		no	no	shared
+shared/js/content.js	3558	700	size	min	min	arg		no	no	shared
+shared/js/content.js	3621	999	other	primaryRect		ternary		no	no	shared
+shared/js/content.js	3622	20	other	right		binary	-	no	no	shared
+shared/js/content.js	3626	24	other	verticalDistance		binary	<=	no	no	shared
+shared/js/content.js	3626	240	threshold	score		assign		no	no	shared
+shared/js/content.js	3627	48	other	verticalDistance		binary	<=	no	no	shared
+shared/js/content.js	3627	80	threshold	score		assign		no	no	shared
+shared/js/content.js	3630	60	threshold	score		assign		no	no	shared
+shared/js/content.js	3633	100	other	left		binary	/	no	no	shared
+shared/js/content.js	3709	28	other	verticalDistance		binary	>	no	no	shared
+shared/js/content.js	3710	-12	other	horizontalDistance		binary	<	no	no	shared
+shared/js/content.js	3714	1000	other	bestDistance		binary	-	no	no	shared
+shared/js/content.js	3740	80	other	width		binary	>	no	no	shared
+shared/js/content.js	3741	360	count	top		binary	>	no	no	shared
+shared/js/content.js	3757	1400	threshold	score		assign		no	no	shared
+shared/js/content.js	3758	900	threshold	score		assign		no	no	shared
+shared/js/content.js	3759	400	threshold	score		assign		no	no	shared
+shared/js/content.js	3760	200	threshold	score		assign		no	no	shared
+shared/js/content.js	3764	24	other	left		binary	-	no	no	shared
+shared/js/content.js	3764	180	threshold	score		assign		no	no	shared
+shared/js/content.js	3765	28	other	verticalDistance		binary	<=	no	no	shared
+shared/js/content.js	3765	260	threshold	score		assign		no	no	shared
+shared/js/content.js	3766	56	other	verticalDistance		binary	<=	no	no	shared
+shared/js/content.js	3766	100	threshold	score		assign		no	no	shared
+shared/js/content.js	3770	420	count	top		binary	<=	no	no	shared
+shared/js/content.js	3770	260	threshold	score		assign		no	no	shared
+shared/js/content.js	3771	500	size	min	min	arg		no	no	shared
+shared/js/content.js	3771	420	count	top		binary	-	no	no	shared
+shared/js/content.js	3773	80	other	left		binary	/	no	no	shared
+shared/js/content.js	3800	420	other	(expr)		binary	<=	no	no	shared
+shared/js/content.js	3868	6	count	PROFILE_BUTTON_RAIL_GAP_PX		decl		yes	no	shared
+shared/js/content.js	3904	150	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	3937	3	count	length		binary	>=	no	no	shared
+shared/js/content.js	3939	255	other	(expr)		binary	/	no	no	shared
+shared/js/content.js	3940	0.5	other	luminance		binary	<	no	no	shared
+shared/js/content.js	4095	500	threshold	score		assign		no	no	shared
+shared/js/content.js	4096	500	threshold	score		assign		no	no	shared
+shared/js/content.js	4097	150	threshold	score		assign		no	no	shared
+shared/js/content.js	4098	150	threshold	score		assign		no	no	shared
+shared/js/content.js	4239	200	threshold	score		assign		no	no	shared
+shared/js/content.js	4240	200	threshold	score		assign		no	no	shared
+shared/js/content.js	4241	300	threshold	score		assign		no	no	shared
+shared/js/content.js	4242	300	threshold	score		assign		no	no	shared
+shared/js/content.js	4243	250	threshold	score		assign		no	no	shared
+shared/js/content.js	4244	300	threshold	score		assign		no	no	shared
+shared/js/content.js	4375	20	size	slice	slice	arg		no	no	shared
+shared/js/content.js	4467	1200	threshold	score		assign		no	no	shared
+shared/js/content.js	4469	1500	threshold	score		assign		no	no	shared
+shared/js/content.js	4470	500	threshold	score		assign		no	no	shared
+shared/js/content.js	4488	500	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	4560	1200	threshold	score		assign		no	no	shared
+shared/js/content.js	4562	1500	threshold	score		assign		no	no	shared
+shared/js/content.js	4563	500	threshold	score		assign		no	no	shared
+shared/js/content.js	4578	500	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	4621	-600	threshold	score		binary	>	no	no	shared
+shared/js/content.js	4652	8	count	depth		binary	<	no	no	shared
+shared/js/content.js	4660	400	threshold	score		assign		no	no	shared
+shared/js/content.js	4661	180	threshold	score		assign		no	no	shared
+shared/js/content.js	4662	500	size	min	min	arg		no	no	shared
+shared/js/content.js	4663	2	count	buttonCount		binary	>=	no	no	shared
+shared/js/content.js	4663	60	threshold	score		assign		no	no	shared
+shared/js/content.js	4664	220	threshold	score		assign		no	no	shared
+shared/js/content.js	4665	80	threshold	score		assign		no	no	shared
+shared/js/content.js	4666	800	threshold	score		assign		no	no	shared
+shared/js/content.js	4689	400	threshold	score		assign		no	no	shared
+shared/js/content.js	4690	180	threshold	score		assign		no	no	shared
+shared/js/content.js	4691	120	threshold	score		assign		no	no	shared
+shared/js/content.js	4692	220	threshold	score		assign		no	no	shared
+shared/js/content.js	4693	500	threshold	score		assign		no	no	shared
+shared/js/content.js	4694	80	threshold	score		assign		no	no	shared
+shared/js/content.js	4695	900	threshold	score		assign		no	no	shared
+shared/js/content.js	4696	220	threshold	score		assign		no	no	shared
+shared/js/content.js	4697	900	threshold	score		assign		no	no	shared
+shared/js/content.js	4699	100	other	left		binary	/	no	no	shared
+shared/js/content.js	4700	200	count	top		binary	/	no	no	shared
+shared/js/content.js	4724	-600	threshold	score		binary	>	no	no	shared
+shared/js/content.js	4821	300	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	4822	2000	time	waitForMenuState	waitForMenuState	arg		no	no	shared
+shared/js/content.js	4822	200	time	waitForMenuState	waitForMenuState	arg		no	no	shared
+shared/js/content.js	4827	250	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	4830	2500	time	ensureProfileMenuOpen	ensureProfileMenuOpen	arg		no	no	shared
+shared/js/content.js	4833	300	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	4838	2500	time	ensureProfileMenuOpen	ensureProfileMenuOpen	arg		no	no	shared
+shared/js/content.js	4841	400	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	4847	250	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	4857	1800	other	readProfileMenuState	readProfileMenuState	arg		no	no	shared
+shared/js/content.js	4857	200	other	readProfileMenuState	readProfileMenuState	arg		no	no	shared
+shared/js/content.js	4921	5000	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	4921	500	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	4963	10	other	matchesScanned		binary	<	no	no	shared
+shared/js/content.js	4967	4000	other	index		binary	-	no	no	shared
+shared/js/content.js	4968	4000	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	5018	6000	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	5018	500	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	5022	20000	time	maxAgeMs		default		no	no	shared
+shared/js/content.js	5028	60000	time	maxAgeMs		default		no	no	shared
+shared/js/content.js	5050	100	other	scheduleBlockedProfileCloseChecks		array		no	no	shared
+shared/js/content.js	5050	250	other	scheduleBlockedProfileCloseChecks		array		no	no	shared
+shared/js/content.js	5050	500	other	scheduleBlockedProfileCloseChecks		array		no	no	shared
+shared/js/content.js	5050	1000	other	scheduleBlockedProfileCloseChecks		array		no	no	shared
+shared/js/content.js	5050	2000	other	scheduleBlockedProfileCloseChecks		array		no	no	shared
+shared/js/content.js	5050	4000	other	scheduleBlockedProfileCloseChecks		array		no	no	shared
+shared/js/content.js	5050	8000	other	scheduleBlockedProfileCloseChecks		array		no	no	shared
+shared/js/content.js	5060	2	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	5060	100	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	5067	700	other	readProfileMenuState	readProfileMenuState	arg		no	no	shared
+shared/js/content.js	5067	100	other	readProfileMenuState	readProfileMenuState	arg		no	no	shared
+shared/js/content.js	5071	2	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	5071	100	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	5081	500	count	scheduleCloseTabFollowUps		array		no	no	shared
+shared/js/content.js	5081	1500	count	scheduleCloseTabFollowUps		array		no	no	shared
+shared/js/content.js	5081	4000	count	scheduleCloseTabFollowUps		array		no	no	shared
+shared/js/content.js	5081	10000	count	scheduleCloseTabFollowUps		array		no	no	shared
+shared/js/content.js	5081	30000	count	scheduleCloseTabFollowUps		array		no	no	shared
+shared/js/content.js	5081	60000	count	scheduleCloseTabFollowUps		array		no	no	shared
+shared/js/content.js	5086	2	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	5086	100	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	5093	3	count	attempts		default		no	no	shared
+shared/js/content.js	5093	150	time	delayMs		default		no	no	shared
+shared/js/content.js	5128	100	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	5160	1000	other	(expr)		binary	<	no	no	shared
+shared/js/content.js	5496	250	time	delay		default		no	no	shared
+shared/js/content.js	5511	10	count	attempt		binary	<	no	no	shared
+shared/js/content.js	5519	350	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	5519	100	count	attempt		binary	*	no	no	shared
+shared/js/content.js	5553	5	size	slice	slice	arg		no	no	shared
+shared/js/content.js	5775	2	count	length		binary	<	no	no	shared
+shared/js/content.js	6028	2000	threshold	score		assign		no	no	shared
+shared/js/content.js	6029	1600	threshold	score		assign		no	no	shared
+shared/js/content.js	6030	1200	threshold	score		assign		no	no	shared
+shared/js/content.js	6031	60	threshold	score		assign		no	no	shared
+shared/js/content.js	6032	600	threshold	score		assign		no	no	shared
+shared/js/content.js	6033	600	threshold	score		assign		no	no	shared
+shared/js/content.js	6034	400	threshold	score		assign		no	no	shared
+shared/js/content.js	6036	20	count	top		binary	/	no	no	shared
+shared/js/content.js	6037	200	other	left		binary	/	no	no	shared
+shared/js/content.js	6079	200	threshold	score		assign		no	no	shared
+shared/js/content.js	6080	600	threshold	score		assign		no	no	shared
+shared/js/content.js	6081	80	threshold	score		assign		no	no	shared
+shared/js/content.js	6082	220	threshold	score		assign		no	no	shared
+shared/js/content.js	6083	120	threshold	score		assign		no	no	shared
+shared/js/content.js	6084	80	threshold	score		assign		no	no	shared
+shared/js/content.js	6085	100	count	top		binary	/	no	no	shared
+shared/js/content.js	6122	200	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	6126	6	count	attempt		binary	<	no	no	shared
+shared/js/content.js	6129	150	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	6230	600	threshold	score		assign		no	no	shared
+shared/js/content.js	6231	240	threshold	score		assign		no	no	shared
+shared/js/content.js	6232	3	count	length		binary	<=	no	no	shared
+shared/js/content.js	6232	120	threshold	score		assign		no	no	shared
+shared/js/content.js	6318	700	threshold	score		assign		no	no	shared
+shared/js/content.js	6319	500	threshold	score		assign		no	no	shared
+shared/js/content.js	6320	2	count	length		binary	>=	no	no	shared
+shared/js/content.js	6320	180	threshold	score		assign		no	no	shared
+shared/js/content.js	6321	40	count	length		binary	>	no	no	shared
+shared/js/content.js	6321	500	threshold	score		assign		no	no	shared
+shared/js/content.js	6356	12	other	headerBottom		binary	+	no	no	shared
+shared/js/content.js	6365	12	other	headerBottom		binary	+	no	no	shared
+shared/js/content.js	6366	12	count	actionBarTop		binary	-	no	no	shared
+shared/js/content.js	6381	12	other	headerBottom		binary	+	no	no	shared
+shared/js/content.js	6382	12	count	actionBarTop		binary	-	no	no	shared
+shared/js/content.js	6471	24	other	width		binary	+	no	no	shared
+shared/js/content.js	6495	10	size	max	max	arg		no	no	shared
+shared/js/content.js	6548	180000	time	waitForOwnedNukeTabsToDrain	waitForOwnedNukeTabsToDrain	arg		no	no	shared
+shared/js/content.js	6548	1000	time	waitForOwnedNukeTabsToDrain	waitForOwnedNukeTabsToDrain	arg		no	no	shared
+shared/js/content.js	6553	180000	time	waitForOwnedNukeTabsToDrain	waitForOwnedNukeTabsToDrain	arg		no	no	shared
+shared/js/content.js	6553	1000	time	waitForOwnedNukeTabsToDrain	waitForOwnedNukeTabsToDrain	arg		no	no	shared
+shared/js/content.js	6669	100	threshold	score		assign		no	no	shared
+shared/js/content.js	6670	40	threshold	score		assign		no	no	shared
+shared/js/content.js	6671	5	threshold	score		assign		no	no	shared
+shared/js/content.js	6928	2	count	length		binary	<	no	no	shared
+shared/js/content.js	7108	16	other	addY	addY	arg		no	no	shared
+shared/js/content.js	7112	16	other	viewportHeight		binary	-	no	no	shared
+shared/js/content.js	7332	120	size	slice	slice	arg		no	no	shared
+shared/js/content.js	7997	250	size	max	max	arg		no	no	shared
+shared/js/content.js	8047	30000	other	(expr)		binary	<	no	no	shared
+shared/js/content.js	8566	24	other	width		binary	+	no	no	shared
+shared/js/content.js	8614	10	size	max	max	arg		no	no	shared
+shared/js/content.js	8637	24	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	8809	40	size	slice	slice	arg		no	no	shared
+shared/js/content.js	8837	120	time	scheduleSpaceAssetNukeControls	scheduleSpaceAssetNukeControls	arg		no	no	shared
+shared/js/content.js	9046	1000	other	value		binary	<	no	no	shared
+shared/js/content.js	9047	10000	other	value		binary	<	no	no	shared
+shared/js/content.js	9100	0.5	other	percentile	percentile	arg		no	no	shared
+shared/js/content.js	9101	0.9	other	percentile	percentile	arg		no	no	shared
+shared/js/content.js	9175	10	size	slice	slice	arg		no	no	shared
+shared/js/content.js	9725	80	time	delay		default		no	no	shared
+shared/js/content.js	9746	2500	time	safeSendRuntimeMessageWithTimeout	safeSendRuntimeMessageWithTimeout	arg		no	no	shared
+shared/js/content.js	10112	2	other	(expr)		binary	**	no	no	shared
+shared/js/content.js	10231	2	size	slice	slice	arg		no	no	shared
+shared/js/content.js	10231	8	size	slice	slice	arg		no	no	shared
+shared/js/content.js	10294	2	size	slice	slice	arg		no	no	shared
+shared/js/content.js	10294	8	size	slice	slice	arg		no	no	shared
+shared/js/content.js	10515	25	count	limit		prop		no	no	shared
+shared/js/content.js	10516	1500	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	10640	40	count	SPACE_FEED_BUTTON_TRACE_LIMIT		decl		yes	no	shared
+shared/js/content.js	10711	-70	other	formatSpaceFeedButtonTrace		CallExpression		no	no	shared
+shared/js/content.js	10713	10	size	slice	slice	arg		no	no	shared
+shared/js/content.js	10971	3	other	SPACE_FEED_EXPAND_CLICKS_PER_PASS		decl		yes	no	shared
+shared/js/content.js	10980	12	other	bottom		binary	+	no	no	shared
+shared/js/content.js	10983	40	size	min	min	arg		no	no	shared
+shared/js/content.js	10987	40	count	length		binary	<	no	no	shared
+shared/js/content.js	11011	800	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	11054	1200	time	scheduleSpaceAssetNukeControls	scheduleSpaceAssetNukeControls	arg		no	no	shared
+shared/js/content.js	11075	120	time	delay		default		no	no	shared
+shared/js/content.js	11124	800	other	scheduleProfileSearchFollowUps		array		no	no	shared
+shared/js/content.js	11124	2000	other	scheduleProfileSearchFollowUps		array		no	no	shared
+shared/js/content.js	11124	5000	other	scheduleProfileSearchFollowUps		array		no	no	shared
+shared/js/content.js	11124	10000	other	scheduleProfileSearchFollowUps		array		no	no	shared
+shared/js/content.js	11215	-80	other	viewportBottom		binary	>=	no	no	shared
+shared/js/content.js	11222	80	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	11229	120	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	11319	500	size	max	max	arg		no	no	shared
+shared/js/content.js	11319	800	other	innerHeight		logical		no	no	shared
+shared/js/content.js	11358	10	count	depth		binary	<	no	no	shared
+shared/js/content.js	11368	260	other	width		binary	>=	no	no	shared
+shared/js/content.js	11368	36	other	height		binary	>=	no	no	shared
+shared/js/content.js	11368	180	other	height		binary	<=	no	no	shared
+shared/js/content.js	11394	-80	other	bottom		binary	<	no	no	shared
+shared/js/content.js	11659	2	count	maxRetries		prop		no	no	shared
+shared/js/content.js	11671	250	time	scheduleProfileSearchControls	scheduleProfileSearchControls	arg		no	no	shared
+shared/js/content.js	11677	250	time	scheduleProfileSearchControls	scheduleProfileSearchControls	arg		no	no	shared
+shared/js/content.js	11727	700	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	11916	20	other	clientHeight		binary	+	no	no	shared
+shared/js/content.js	11957	240	size	max	max	arg		no	no	shared
+shared/js/content.js	11969	900	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	12010	5000	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	12091	900	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	12107	180000	time	waitForOwnedNukeTabsToDrain	waitForOwnedNukeTabsToDrain	arg		no	no	shared
+shared/js/content.js	12107	1000	time	waitForOwnedNukeTabsToDrain	waitForOwnedNukeTabsToDrain	arg		no	no	shared
+shared/js/content.js	12308	1000	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/content.js	12351	2	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	12351	100	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	12366	2	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	12366	100	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	12381	2	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	12381	100	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	12388	10	count	attempt		binary	<	no	no	shared
+shared/js/content.js	12393	350	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	12393	100	count	attempt		binary	*	no	no	shared
+shared/js/content.js	12483	2500	size	min	min	arg		no	no	shared
+shared/js/content.js	12484	100	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	12565	250	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	12743	5000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	12743	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	12781	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	12836	3500	time	waitForVerifiedProfileUnblocked	waitForVerifiedProfileUnblocked	arg		no	no	shared
+shared/js/content.js	12836	250	time	waitForVerifiedProfileUnblocked	waitForVerifiedProfileUnblocked	arg		no	no	shared
+shared/js/content.js	12846	2	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	12846	100	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	12882	5000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	12882	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	12937	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13049	2500	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13049	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13064	4000	size	slice	slice	arg		no	no	shared
+shared/js/content.js	13077	2	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	13077	100	time	requestCloseTab	requestCloseTab	arg		no	no	shared
+shared/js/content.js	13118	500	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	13146	500	other	(expr)		binary	+	no	no	shared
+shared/js/content.js	13239	1200	threshold	score		assign		no	no	shared
+shared/js/content.js	13241	1500	threshold	score		assign		no	no	shared
+shared/js/content.js	13242	500	threshold	score		assign		no	no	shared
+shared/js/content.js	13271	900	threshold	score		assign		no	no	shared
+shared/js/content.js	13272	600	threshold	score		assign		no	no	shared
+shared/js/content.js	13274	900	threshold	score		assign		no	no	shared
+shared/js/content.js	13275	1200	threshold	score		assign		no	no	shared
+shared/js/content.js	13292	250	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13337	320	other	compactElementText	compactElementText	arg		no	no	shared
+shared/js/content.js	13413	100	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13416	100	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13419	100	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13425	100	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13434	150	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13544	2500	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13544	100	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13556	3500	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13556	100	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13593	2	size	slice	slice	arg		no	no	shared
+shared/js/content.js	13593	10	size	slice	slice	arg		no	no	shared
+shared/js/content.js	13600	3500	time	safeSendRuntimeMessageWithTimeout	safeSendRuntimeMessageWithTimeout	arg		no	no	shared
+shared/js/content.js	13622	32	other	(expr)		ternary		no	no	shared
+shared/js/content.js	13622	13	other	(expr)		ternary		no	no	shared
+shared/js/content.js	13646	5000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13646	100	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13649	2500	time	ensureProfileMenuOpen	ensureProfileMenuOpen	arg		no	no	shared
+shared/js/content.js	13652	300	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13659	5000	time	timeoutMs		prop		no	no	shared
+shared/js/content.js	13660	250	time	intervalMs		prop		no	no	shared
+shared/js/content.js	13680	250	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13681	2500	time	ensureProfileMenuOpen	ensureProfileMenuOpen	arg		no	no	shared
+shared/js/content.js	13683	300	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13723	5000	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	13723	250	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	13733	3000	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	13733	250	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	13760	2500	other	(expr)		ternary		no	no	shared
+shared/js/content.js	13760	8000	other	(expr)		ternary		no	no	shared
+shared/js/content.js	13761	250	time	waitForVerifiedProfileUnblocked	waitForVerifiedProfileUnblocked	arg		no	no	shared
+shared/js/content.js	13775	8000	time	waitForVerifiedProfileUnblocked	waitForVerifiedProfileUnblocked	arg		no	no	shared
+shared/js/content.js	13775	250	time	waitForVerifiedProfileUnblocked	waitForVerifiedProfileUnblocked	arg		no	no	shared
+shared/js/content.js	13797	2500	time	ensureProfileMenuOpen	ensureProfileMenuOpen	arg		no	no	shared
+shared/js/content.js	13800	300	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13803	5000	time	timeoutMs		prop		no	no	shared
+shared/js/content.js	13804	250	time	intervalMs		prop		no	no	shared
+shared/js/content.js	13823	1500	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	13823	250	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	13828	2500	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	13828	500	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	13835	5000	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	13835	500	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	13844	8000	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	13844	500	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	13860	1500	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13860	100	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13863	1500	time	ensureProfileMenuOpen	ensureProfileMenuOpen	arg		no	no	shared
+shared/js/content.js	13866	150	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	13869	2000	time	timeoutMs		prop		no	no	shared
+shared/js/content.js	13870	150	time	intervalMs		prop		no	no	shared
+shared/js/content.js	13889	1000	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	13889	150	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	13892	2500	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13892	200	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13895	2500	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	13895	250	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	13929	200	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	13945	3	count	maxReverseAttempts		decl		no	no	shared
+shared/js/content.js	13957	5000	time	waitForCanonicalProfileActionRoute	waitForCanonicalProfileActionRoute	arg		no	no	shared
+shared/js/content.js	13959	3500	time	waitForVerifiedProfileUnblocked	waitForVerifiedProfileUnblocked	arg		no	no	shared
+shared/js/content.js	13959	250	time	waitForVerifiedProfileUnblocked	waitForVerifiedProfileUnblocked	arg		no	no	shared
+shared/js/content.js	13994	5000	time	waitForCanonicalProfileActionRoute	waitForCanonicalProfileActionRoute	arg		no	no	shared
+shared/js/content.js	13995	750	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	14036	150	time	scheduleProfileButtonsRefresh	scheduleProfileButtonsRefresh	arg		no	no	shared
+shared/js/content.js	14067	2500	time	ensureProfileMenuOpen	ensureProfileMenuOpen	arg		no	no	shared
+shared/js/content.js	14080	5000	time	timeoutMs		prop		no	no	shared
+shared/js/content.js	14081	250	time	intervalMs		prop		no	no	shared
+shared/js/content.js	14108	8000	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	14108	250	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	14134	2500	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14134	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14152	6000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14152	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14166	8000	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	14166	500	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	14184	300	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	14244	2500	time	ensureProfileMenuOpen	ensureProfileMenuOpen	arg		no	no	shared
+shared/js/content.js	14264	5000	time	timeoutMs		prop		no	no	shared
+shared/js/content.js	14279	250	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	14280	2500	time	ensureProfileMenuOpen	ensureProfileMenuOpen	arg		no	no	shared
+shared/js/content.js	14282	500	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	14284	3000	time	timeoutMs		prop		no	no	shared
+shared/js/content.js	14285	200	time	intervalMs		prop		no	no	shared
+shared/js/content.js	14348	8000	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	14348	250	time	waitForAction	waitForAction	arg		no	no	shared
+shared/js/content.js	14351	1500	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	14351	200	time	waitForProfileMenuState	waitForProfileMenuState	arg		no	no	shared
+shared/js/content.js	14414	5000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14414	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14416	2500	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14416	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14439	6000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14439	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14457	8000	time	waitForVerifiedProfileBlocked	waitForVerifiedProfileBlocked	arg		no	no	shared
+shared/js/content.js	14457	250	time	waitForVerifiedProfileBlocked	waitForVerifiedProfileBlocked	arg		no	no	shared
+shared/js/content.js	14479	150	time	scheduleProfileButtonsRefresh	scheduleProfileButtonsRefresh	arg		no	no	shared
+shared/js/content.js	14480	3000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14480	150	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14509	5000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14509	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14511	2500	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14511	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14529	6000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14529	250	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14543	8000	time	waitForVerifiedProfileBlocked	waitForVerifiedProfileBlocked	arg		no	no	shared
+shared/js/content.js	14543	250	time	waitForVerifiedProfileBlocked	waitForVerifiedProfileBlocked	arg		no	no	shared
+shared/js/content.js	14562	150	time	scheduleProfileButtonsRefresh	scheduleProfileButtonsRefresh	arg		no	no	shared
+shared/js/content.js	14563	3000	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14563	150	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14601	200	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	14611	27	other	keyCode		prop		no	no	shared
+shared/js/content.js	14612	27	other	which		prop		no	no	shared
+shared/js/content.js	14625	100	time	waitForConditionOrDomMutation	waitForConditionOrDomMutation	arg		no	no	shared
+shared/js/content.js	14630	1200	size	min	min	arg		no	no	shared
+shared/js/content.js	14630	100	time	waitForConditionOrDomMutation	waitForConditionOrDomMutation	arg		no	no	shared
+shared/js/content.js	14637	1200	size	min	min	arg		no	no	shared
+shared/js/content.js	14637	100	time	waitForConditionOrDomMutation	waitForConditionOrDomMutation	arg		no	no	shared
+shared/js/content.js	14653	300	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	14655	2	count	attempt		binary	<	no	no	shared
+shared/js/content.js	14658	100	time	waitForConditionOrDomMutation	waitForConditionOrDomMutation	arg		no	no	shared
+shared/js/content.js	14660	250	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	14665	2	count	attempt		binary	<	no	no	shared
+shared/js/content.js	14667	200	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	14670	1800	size	min	min	arg		no	no	shared
+shared/js/content.js	14670	100	time	waitForConditionOrDomMutation	waitForConditionOrDomMutation	arg		no	no	shared
+shared/js/content.js	14675	1200	size	min	min	arg		no	no	shared
+shared/js/content.js	14675	100	time	waitForConditionOrDomMutation	waitForConditionOrDomMutation	arg		no	no	shared
+shared/js/content.js	14678	250	time	sleep	sleep	arg		no	no	shared
+shared/js/content.js	14697	600	size	min	min	arg		no	no	shared
+shared/js/content.js	14698	100	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14702	100	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/content.js	14706	100	time	waitForCondition	waitForCondition	arg		no	no	shared
+shared/js/coordinator.js	62	30	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	65	2000	time	DASHBOARD_COMPACT_REFRESH_INTERVAL_MS		decl		yes	no	shared
+shared/js/coordinator.js	66	100	time	DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS		decl		yes	no	shared
+shared/js/coordinator.js	68	70000	time	CURRENT_WORK_MUTATION_TIMEOUT_MS		decl		yes	no	shared
+shared/js/coordinator.js	614	1000	time	setInterval	setInterval	arg		no	no	shared
+shared/js/coordinator.js	694	60	time	totalSeconds		binary	%	no	no	shared
+shared/js/coordinator.js	853	500	count	MAX_DASHBOARD_EVENTS		decl		yes	no	shared
+shared/js/coordinator.js	1140	100	size	min	min	arg		no	no	shared
+shared/js/coordinator.js	1140	100	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	1170	100	size	min	min	arg		no	no	shared
+shared/js/coordinator.js	1170	100	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	1717	700	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/coordinator.js	1758	20000	count	limit		prop		no	no	shared
+shared/js/coordinator.js	1767	2	other	stringify	stringify	arg		no	no	shared
+shared/js/coordinator.js	1775	1000	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/coordinator.js	2144	100	time	seconds		binary	>=	no	no	shared
+shared/js/coordinator.js	2145	10	time	seconds		binary	>=	no	no	shared
+shared/js/coordinator.js	2407	2	other	level		binary	>=	no	no	shared
+shared/js/coordinator.js	2411	3	other	(expr)		binary	>	no	no	shared
+shared/js/coordinator.js	2425	0.3	other	(expr)		binary	<	no	no	shared
+shared/js/coordinator.js	2429	0.7	other	(expr)		binary	>	no	no	shared
+shared/js/coordinator.js	2429	0.3	other	(expr)		binary	<	no	no	shared
+shared/js/coordinator.js	2450	15000	other	(expr)		binary	>=	no	no	shared
+shared/js/coordinator.js	2455	22500	other	(expr)		binary	>=	no	no	shared
+shared/js/coordinator.js	2460	1250	other	(expr)		binary	>=	no	no	shared
+shared/js/coordinator.js	2481	0.5	other	(expr)		binary	>	no	no	shared
+shared/js/coordinator.js	2494	0.5	other	(expr)		binary	>	no	no	shared
+shared/js/coordinator.js	2499	15000	other	(expr)		binary	>=	no	no	shared
+shared/js/coordinator.js	2510	5	count	walCacheAttempts		binary	>	no	no	shared
+shared/js/coordinator.js	2510	0.5	other	(expr)		binary	<	no	no	shared
+shared/js/coordinator.js	2565	30	size	slice	slice	arg		no	no	shared
+shared/js/coordinator.js	2687	100	other	value		binary	>=	no	no	shared
+shared/js/coordinator.js	2688	10	other	value		binary	>=	no	no	shared
+shared/js/coordinator.js	2694	100	other	value		binary	*	no	no	shared
+shared/js/coordinator.js	2700	1024	count	bytes		binary	<	no	no	shared
+shared/js/coordinator.js	2701	1024	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	2701	1024	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	2701	1024	count	bytes		binary	/	no	no	shared
+shared/js/coordinator.js	2701	10	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	2701	1024	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	2702	1024	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	2702	1024	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	2702	10	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	2702	1024	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	2702	1024	other	(expr)		binary	*	no	no	shared
+shared/js/coordinator.js	2747	3	size	slice	slice	arg		no	no	shared
+shared/js/coordinator.js	2791	14	size	slice	slice	arg		no	no	shared
+shared/js/coordinator.js	3012	2	other	getCurrentWorkSortRank		return		no	no	shared
+shared/js/coordinator.js	3013	3	other	getCurrentWorkSortRank		return		no	no	shared
+shared/js/coordinator.js	3014	4	other	getCurrentWorkSortRank		return		no	no	shared
+shared/js/coordinator.js	3015	5	other	getCurrentWorkSortRank		return		no	no	shared
+shared/js/coordinator.js	3348	3600	time	totalSeconds		binary	%	no	no	shared
+shared/js/coordinator.js	3349	60	time	totalSeconds		binary	%	no	no	shared
+shared/js/coordinator.js	3426	2000	count	limit		prop		no	no	shared
+shared/js/coordinator.js	3472	1000	other	value		binary	<	no	no	shared
+shared/js/coordinator.js	3473	10000	other	value		binary	<	no	no	shared
+shared/js/coordinator.js	3537	200	count	barMaxWidth		decl		no	no	shared
+shared/js/coordinatorEnqueueChunking.js	12	50	shard	COORDINATOR_ENQUEUE_CHUNK_SIZE		prop		no	no	shared
+shared/js/coordinatorEventRecord.js	9	240	size	slice	slice	arg		no	no	shared
+shared/js/jobState.js	10	2	other	JOB_SCHEMA_VERSION		decl		yes	no	shared
+shared/js/nukedPosts.js	4	30	count	DEFAULT_NUKED_POST_RETENTION_DAYS		decl		yes	no	shared
+shared/js/nukedPosts.js	5	10000	count	DEFAULT_MAX_REMEMBERED_NUKED_POSTS		decl		yes	no	shared
+shared/js/preferences.js	222	1200	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/queueProgressBar.js	42	16	other	width		assign		no	no	shared
+shared/js/queueProgressBar.js	43	16	other	height		assign		no	no	shared
+shared/js/queueProgressBar.js	94	100	size	min	min	arg		no	no	shared
+shared/js/sharedModeration.js	34	2	other	(top)		array		no	no	shared
+shared/js/sharedModeration.js	35	3	other	(top)		array		no	no	shared
+shared/js/sharedModeration.js	36	4	other	(top)		array		no	no	shared
+shared/js/sharedModeration.js	37	5	other	(top)		array		no	no	shared
+shared/js/spaceMapStorage.js	11	32	shard	SPACE_MAP_BUCKET_COUNT		decl		yes	no	shared
+shared/js/spaceMapStorage.js	13	2	shard	SPACE_MAP_LAYOUT_BUCKETED		decl		yes	no	shared
+shared/js/spaceRegistry.js	12	2	other	SPACE_CATEGORY_TARGET		prop		no	no	shared
+shared/js/spaceRegistry.js	120	99	other	(expr)		logical		no	no	shared
+shared/js/spaceRegistry.js	120	99	other	(expr)		logical		no	no	shared
+shared/js/subject.js	38	2	count	length		binary	<	no	no	shared
+shared/js/subject.js	49	2	count	length		binary	>=	no	no	shared
+shared/js/subject.js	69	2	count	length		binary	<	no	no	shared
+shared/js/subject.js	86	3	count	length		binary	>=	no	no	shared
+shared/js/subject.js	99	2	count	length		binary	<	no	no	shared
+shared/js/subject.js	112	2	count	proseCount		binary	>=	no	no	shared
+shared/js/subject.js	115	4	count	length		binary	>	no	no	shared
+shared/js/subject.js	115	2	count	nonNameishCount		binary	>=	no	no	shared
+shared/js/subject.js	116	6	count	length		binary	>	no	no	shared
+shared/js/subject.js	117	8	count	length		binary	>	no	no	shared
+shared/js/subject.js	142	2	count	length		binary	<	no	no	shared
+shared/js/subject.js	143	8	count	length		binary	>	no	no	shared
+shared/js/subject.js	151	3	count	length		binary	>=	no	no	shared
+shared/js/subject.js	165	2	count	nameishTokenCount		binary	>=	no	no	shared
+shared/js/subject.js	174	2	count	length		binary	>=	no	no	shared
+shared/js/subject.js	193	4000	count	NORMALIZED_PROFILE_HREF_MEMO_LIMIT		decl		yes	no	shared
+shared/js/subject.js	265	2	count	length		binary	<	no	no	shared
+shared/js/subject.js	270	2	count	length		binary	>=	no	no	shared
+shared/js/sw.js	387	30000	time	EXECUTOR_CLASSIFY_BACKSTOP_MS		decl		yes	no	shared
+shared/js/sw.js	499	128	other	COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT		decl		yes	no	shared
+shared/js/sw.js	500	1024	count	COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT		decl		yes	no	shared
+shared/js/sw.js	517	256	other	COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT		decl		yes	no	shared
+shared/js/sw.js	539	2	count	COORDINATOR_QUEUE_WAL_HYDRATE_ATTEMPTS		decl		yes	no	shared
+shared/js/sw.js	550	120000	time	COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	586	100	shard	COORDINATOR_ENQUEUE_CHUNK_THRESHOLD		decl		yes	no	shared
+shared/js/sw.js	600	25	shard	COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE		decl		yes	no	shared
+shared/js/sw.js	629	25	shard	COORDINATOR_PROGRESS_RECONCILE_CHUNK_SIZE		decl		yes	no	shared
+shared/js/sw.js	655	25	shard	COORDINATOR_MILESTONE_FLUSH_CHUNK_SIZE		decl		yes	no	shared
+shared/js/sw.js	662	100	other	(expr)		binary	*	no	no	shared
+shared/js/sw.js	662	1024	other	(expr)		binary	*	no	no	shared
+shared/js/sw.js	662	1024	other	(expr)		binary	*	no	no	shared
+shared/js/sw.js	663	0.8	threshold	COORDINATOR_STORAGE_QUOTA_WARN_RATIO		decl		yes	no	shared
+shared/js/sw.js	664	60000	time	COORDINATOR_STORAGE_QUOTA_CHECK_INTERVAL_MS		decl		yes	no	shared
+shared/js/sw.js	673	30000	time	COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS		decl		yes	no	shared
+shared/js/sw.js	674	15000	time	COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_CHECK_INTERVAL_MS		decl		yes	no	shared
+shared/js/sw.js	704	4	other	QUEUE_WAKEUP_METRICS_VERSION		decl		yes	no	shared
+shared/js/sw.js	720	500	count	MAX_COORDINATOR_EVENTS		decl		yes	no	shared
+shared/js/sw.js	721	1200	count	MAX_COORDINATOR_CONTENT_QUEUE_INDEX_ITEMS		decl		yes	no	shared
+shared/js/sw.js	722	1200	count	MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS		decl		yes	no	shared
+shared/js/sw.js	723	32	shard	COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT		decl		yes	no	shared
+shared/js/sw.js	724	256	shard	PROFILE_NUKE_PROGRESS_SHARD_COUNT		decl		yes	no	shared
+shared/js/sw.js	726	32	shard	LEGACY_PROFILE_NUKE_PROGRESS_SHARD_COUNT		decl		yes	no	shared
+shared/js/sw.js	733	32	shard	COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT		decl		yes	no	shared
+shared/js/sw.js	767	64	count	MAX_QUEUE_WAKEUP_METRIC_PHASES		decl		yes	no	shared
+shared/js/sw.js	782	8	count	MAX_QUEUE_WAKEUP_METRIC_EPOCH_HISTORY		decl		yes	no	shared
+shared/js/sw.js	784	10000	time	STALE_ACTIVE_QUEUED_TAB_MS		decl		yes	no	shared
+shared/js/sw.js	785	15000	time	QUEUED_TAB_CONTENT_ACTOR_READINESS_WINDOW_MS		decl		yes	no	shared
+shared/js/sw.js	786	20000	time	STALE_BACKGROUND_OPENING_QUEUED_TAB_MS		decl		yes	no	shared
+shared/js/sw.js	787	20000	time	STALE_BACKGROUND_READY_QUEUED_TAB_MS		decl		yes	no	shared
+shared/js/sw.js	788	30000	time	STALE_ACTIVE_ACTION_QUEUED_TAB_MS		decl		yes	no	shared
+shared/js/sw.js	789	45000	time	STALE_UNBLOCK_UNMUTE_ACTION_QUEUED_TAB_MS		decl		yes	no	shared
+shared/js/sw.js	790	45000	time	STALE_FOREGROUND_WAIT_QUEUED_TAB_MS		decl		yes	no	shared
+shared/js/sw.js	791	45000	time	COORDINATOR_ACTIVE_JOB_MAX_MS		decl		yes	no	shared
+shared/js/sw.js	792	60000	time	COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS		decl		yes	no	shared
+shared/js/sw.js	793	15000	time	PERSISTED_EXECUTOR_TRANSIENT_URL_MAX_AGE_MS		decl		yes	no	shared
+shared/js/sw.js	794	90000	time	ACTION_LEASE_MS		decl		yes	no	shared
+shared/js/sw.js	795	8000	time	STALE_CLOSE_REQUESTED_QUEUED_TAB_MS		decl		yes	no	shared
+shared/js/sw.js	823	5000	time	FOREGROUND_LEASE_WAIT_EVENT_MS		decl		yes	no	shared
+shared/js/sw.js	824	5000	time	COORDINATOR_RECONCILE_INTERVAL_MS		decl		yes	no	shared
+shared/js/sw.js	828	60000	time	TERMINAL_OWNED_TAB_ORPHAN_SWEEP_MIN_INTERVAL_MS		decl		yes	no	shared
+shared/js/sw.js	829	5000	time	COORDINATOR_RECONCILE_BACKOFF_BASE_MS		decl		yes	no	shared
+shared/js/sw.js	830	60000	time	COORDINATOR_RECONCILE_BACKOFF_MAX_MS		decl		yes	no	shared
+shared/js/sw.js	831	5000	time	STALE_SCHEDULER_ALARM_SUPPRESSION_MS		decl		yes	no	shared
+shared/js/sw.js	832	100	time	SCHEDULER_ALARM_TIME_TOLERANCE_MS		decl		yes	no	shared
+shared/js/sw.js	833	15000	time	SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	834	1000	time	QUORA_RUNTIME_TAB_QUERY_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	835	2500	time	QUEUED_TAB_GET_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	836	15000	time	COORDINATOR_RECONCILE_GATE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	837	30000	time	COORDINATOR_RESUME_GATE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	838	3000	time	BACKGROUND_FAST_RESUME_RESPONSE_BUDGET_MS		decl		yes	no	shared
+shared/js/sw.js	839	20000	time	COORDINATOR_STORED_WORK_RESTORE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	840	180000	time	COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	843	30000	time	QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS		decl		yes	no	shared
+shared/js/sw.js	844	30000	time	COORDINATOR_IDLE_RECONCILE_PROMISE_STALE_MS		decl		yes	no	shared
+shared/js/sw.js	845	1500	time	COORDINATOR_IDLE_EXECUTOR_START_PROMISE_STALE_MS		decl		yes	no	shared
+shared/js/sw.js	846	250	time	COORDINATOR_DETACHED_EXECUTOR_START_PROMISE_STALE_MS		decl		yes	no	shared
+shared/js/sw.js	847	30000	time	BACKGROUND_BLOCKED_SWEEP_TERMINAL_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	848	30000	time	ACTIVE_BLOCKED_LIVE_TAB_TERMINAL_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	850	25	count	COORDINATOR_EXHAUSTED_ROLLBACK_TERMINATE_BATCH_LIMIT		decl		yes	no	shared
+shared/js/sw.js	851	120000	time	COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	852	60000	time	COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS		binary	+	no	no	shared
+shared/js/sw.js	853	60000	time	SCHEDULER_ALARM_LATE_TOLERANCE_MS		decl		yes	no	shared
+shared/js/sw.js	854	3000	time	COORDINATOR_JOB_MILESTONE_FLUSH_MS		decl		yes	no	shared
+shared/js/sw.js	855	5000	time	PERSISTENT_FAILED_RETRY_INTERVAL_MS		decl		yes	no	shared
+shared/js/sw.js	857	0.5	time	PERSISTENT_FAILED_RETRY_ALARM_PERIOD_MINUTES		decl		yes	no	shared
+shared/js/sw.js	864	750	time	QUEUED_TAB_CONTENT_SCRIPT_CHECK_DELAY_MS		decl		yes	no	shared
+shared/js/sw.js	872	20000	time	CLOUDFLARE_CHALLENGE_RELOAD_SUPPRESSION_MS		decl		yes	no	shared
+shared/js/sw.js	873	5000	time	QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	874	10000	time	QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	875	1000	time	QUEUED_TAB_ACTION_CLAIM_NUDGE_COALESCE_MS		decl		yes	no	shared
+shared/js/sw.js	876	15000	time	QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	877	3000	time	QUEUED_TAB_FINAL_OPEN_DECISION_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	878	30000	time	QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS		decl		yes	no	shared
+shared/js/sw.js	879	250	time	QUEUED_TAB_PRE_OPEN_RETRY_MS		decl		yes	no	shared
+shared/js/sw.js	891	250	time	TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS		decl		yes	no	shared
+shared/js/sw.js	892	15000	time	QUEUED_PROFILE_OPEN_RESERVATION_TTL_MS		decl		yes	no	shared
+shared/js/sw.js	893	60000	time	QUEUED_ACTIVATION_GUARD_TTL_MS		decl		yes	no	shared
+shared/js/sw.js	894	1000	time	QUEUED_TAB_PRE_OPEN_FILL_TIMEOUT_RETRY_MS		decl		yes	no	shared
+shared/js/sw.js	895	5000	time	QUEUED_TAB_CLAIM_NUDGE_TIMEOUT_ESCALATION_MS		decl		yes	no	shared
+shared/js/sw.js	896	5000	time	SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS		binary	+	no	no	shared
+shared/js/sw.js	897	5000	time	QUEUED_TAB_FAST_ACTIVE_TRANSITION_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	898	10000	time	QUEUED_TAB_CREATE_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	899	5000	time	QUEUED_TAB_OPEN_URL_COMMIT_TIMEOUT_MS		decl		yes	no	shared
+shared/js/sw.js	900	5000	time	QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS		decl		yes	no	shared
+shared/js/sw.js	901	15000	time	QUEUE_LOAD_THROTTLE_BASE_MS		decl		yes	no	shared
+shared/js/sw.js	902	5	time	QUEUE_LOAD_THROTTLE_MAX_LEVEL		decl		yes	no	shared
+shared/js/sw.js	903	2000	time	QUEUE_LOAD_THROTTLE_SIGNAL_COOLDOWN_MS		decl		yes	no	shared
+shared/js/sw.js	904	250	time	COORDINATOR_RECONCILE_OBSERVE_ROW_BUDGET		decl		yes	no	shared
+shared/js/sw.js	905	25	time	COORDINATOR_RECONCILE_ACTION_BUDGET		decl		yes	no	shared
+shared/js/sw.js	906	128	count	MAX_PROGRESS_SHADOW_WAL_RECORDS		decl		yes	no	shared
+shared/js/sw.js	907	128	count	MAX_COORDINATOR_AUTHORITY_SHADOW_WAL_RECORDS		decl		yes	no	shared
+shared/js/sw.js	965	4	count	normalizeTargetQueuedTabConcurrency	normalizeTargetQueuedTabConcurrency	arg		no	no	shared
+shared/js/sw.js	1069	750	time	CLOSE_IF_BLOCKED_MIN_PROBE_INTERVAL_MS		decl		yes	no	shared
+shared/js/sw.js	1127	250	time	QUEUED_WORK_CONTINUATION_BACKGROUND_KICK_RETRY_DELAY_MS		decl		yes	no	shared
+shared/js/sw.js	2059	1000	time	promiseWithTimeout	promiseWithTimeout	arg		no	no	shared
+shared/js/sw.js	2220	1000	time	promiseWithTimeout	promiseWithTimeout	arg		no	no	shared
+shared/js/sw.js	2340	1000	time	promiseWithTimeout	promiseWithTimeout	arg		no	no	shared
+shared/js/sw.js	2674	8	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	2799	12	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	2827	12	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	3627	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	3745	1500	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	3748	2000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	3906	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4045	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4312	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4466	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4498	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4553	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4588	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4593	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	4604	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4640	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4781	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4792	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	4883	30000	time	projectionReconcileDelayMs		prop		no	no	shared
+shared/js/sw.js	4945	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	5012	30000	time	projectionReconcileDelayMs		prop		no	no	shared
+shared/js/sw.js	5059	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	5098	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	5285	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	5299	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	5300	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	5404	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	5408	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	5487	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	5497	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	5575	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	5579	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	6305	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	6317	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	6536	50	count	limit		default		no	no	shared
+shared/js/sw.js	6693	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	7492	2	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	7492	10	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	7891	100	threshold	COORDINATOR_STORAGE_QUOTA_WARN_RATIO		binary	*	no	no	shared
+shared/js/sw.js	8078	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	8123	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	8246	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	8321	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	8512	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	8574	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	8787	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	8796	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	8998	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	9104	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	9120	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	9140	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	9298	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	9325	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	9448	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	9506	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	9770	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	10351	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	10774	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	11172	50	count	limit		default		no	no	shared
+shared/js/sw.js	11465	1000	size	max	max	arg		no	no	shared
+shared/js/sw.js	11969	50	other	completedRecent	completedRecent	arg		no	no	shared
+shared/js/sw.js	12119	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	12157	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	12171	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	12327	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	12435	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	12455	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	12528	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	13127	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	13785	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	13861	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	14281	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	14408	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	14411	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	14752	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	15256	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	15282	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	15320	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	15351	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	15403	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	15428	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	16153	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	16160	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	16318	100	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	16345	100	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	16348	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	16368	100	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	17007	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	17031	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	17035	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	17043	4000	time	scheduleOwnedBlockedProfileSweep	scheduleOwnedBlockedProfileSweep	arg		no	no	shared
+shared/js/sw.js	17129	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	17132	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	17181	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	17300	4000	time	scheduleOwnedBlockedProfileSweep	scheduleOwnedBlockedProfileSweep	arg		no	no	shared
+shared/js/sw.js	17313	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	18119	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	18675	10	other	(expr)		binary	*	no	no	shared
+shared/js/sw.js	18797	3	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	18798	3	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	18814	3	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	18815	3	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	19095	250	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19129	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19132	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19169	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19172	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19338	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19341	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19409	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19412	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19429	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19432	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19471	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19474	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19487	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19490	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19523	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19526	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19551	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19554	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19582	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19585	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19610	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19658	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19675	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19749	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19752	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19793	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19796	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	19902	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	19905	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20045	500	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	20048	500	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20076	500	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	20079	500	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20113	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	20362	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	20365	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20395	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	20398	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20451	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	20458	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20489	500	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	20564	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	20568	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20717	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20783	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20839	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	20901	1000	other	(expr)		ternary		no	no	shared
+shared/js/sw.js	20906	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	21032	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	21063	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	21095	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	21111	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21114	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	21146	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21149	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	21257	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21260	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	21277	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21280	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	21319	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21440	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21443	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	21469	100	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/sw.js	21485	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21494	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21516	100	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/sw.js	21572	600	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21599	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21638	250	size	max	max	arg		no	no	shared
+shared/js/sw.js	21675	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21733	600	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21737	3	other	(expr)		logical		no	no	shared
+shared/js/sw.js	21749	5000	size	max	max	arg		no	no	shared
+shared/js/sw.js	21749	15000	other	(expr)		logical		no	no	shared
+shared/js/sw.js	21788	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	21830	1000	size	max	max	arg		no	no	shared
+shared/js/sw.js	21830	15000	other	(expr)		logical		no	no	shared
+shared/js/sw.js	21850	250	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/sw.js	21853	1000	size	max	max	arg		no	no	shared
+shared/js/sw.js	21853	15000	other	(expr)		logical		no	no	shared
+shared/js/sw.js	22379	300	time	setTimeout	setTimeout	arg		no	no	shared
+shared/js/sw.js	23093	1000	size	max	max	arg		no	no	shared
+shared/js/sw.js	23144	500	time	delayMs		default		no	no	shared
+shared/js/sw.js	23147	100	size	max	max	arg		no	no	shared
+shared/js/sw.js	23147	500	other	(expr)		logical		no	no	shared
+shared/js/sw.js	23190	1000	size	max	max	arg		no	no	shared
+shared/js/sw.js	23190	100	other	(expr)		binary	+	no	no	shared
+shared/js/sw.js	23230	1000	time	promiseWithTimeout	promiseWithTimeout	arg		no	no	shared
+shared/js/sw.js	23644	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	23869	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	24014	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	24138	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	24322	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	24391	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	24419	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	24683	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	24748	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	24775	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	25400	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	25457	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	25490	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	25536	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	25812	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	25823	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	25899	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	26209	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	26370	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	26440	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	26488	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	26541	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	26674	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	26793	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	26845	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	26972	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	27020	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	27084	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	27255	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	27405	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	27412	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	27525	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	27630	30000	time	projectionReconcileDelayMs		prop		no	no	shared
+shared/js/sw.js	27843	30000	time	projectionReconcileDelayMs		prop		no	no	shared
+shared/js/sw.js	27928	30000	time	projectionReconcileDelayMs		prop		no	no	shared
+shared/js/sw.js	27993	30000	time	projectionReconcileDelayMs		prop		no	no	shared
+shared/js/sw.js	28752	1500	time	delayMs		default		no	no	shared
+shared/js/sw.js	28753	250	size	max	max	arg		no	no	shared
+shared/js/sw.js	28753	1500	other	(expr)		logical		no	no	shared
+shared/js/sw.js	28996	10000	time	ORPHAN_SURFACE_TAB_GRACE_MS		decl		yes	no	shared
+shared/js/sw.js	29402	8	count	depth		binary	<	no	no	shared
+shared/js/sw.js	29459	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	29532	80	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	29738	5	count	releaseAttempt		binary	<	no	no	shared
+shared/js/sw.js	29738	100	other	(expr)		ternary		no	no	shared
+shared/js/sw.js	29738	1000	other	(expr)		ternary		no	no	shared
+shared/js/sw.js	29739	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	29788	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	29793	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	29797	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	30112	100	time	scheduleQueuedTabContentScriptEnsure	scheduleQueuedTabContentScriptEnsure	arg		no	no	shared
+shared/js/sw.js	30123	1000	time	scheduleOwnedBlockedProfileSweep	scheduleOwnedBlockedProfileSweep	arg		no	no	shared
+shared/js/sw.js	30139	250	count	nudgeQueuedTabActionClaimWithRetries		array		no	no	shared
+shared/js/sw.js	30139	750	count	nudgeQueuedTabActionClaimWithRetries		array		no	no	shared
+shared/js/sw.js	30139	1500	count	nudgeQueuedTabActionClaimWithRetries		array		no	no	shared
+shared/js/sw.js	30153	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	30158	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	30559	3000	time	delayMs		default		no	no	shared
+shared/js/sw.js	30569	5000	time	scheduleOwnedBlockedProfileSweep	scheduleOwnedBlockedProfileSweep	arg		no	no	shared
+shared/js/sw.js	30573	500	size	max	max	arg		no	no	shared
+shared/js/sw.js	30573	3000	other	(expr)		logical		no	no	shared
+shared/js/sw.js	30718	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	30908	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	31404	1500	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	31407	2000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	31664	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	31667	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	31676	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	31700	2	count	length		binary	<	no	no	shared
+shared/js/sw.js	31734	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	31737	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	31762	100	other	(expr)		ternary		no	no	shared
+shared/js/sw.js	31762	500	other	(expr)		ternary		no	no	shared
+shared/js/sw.js	31923	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	31937	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32068	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32071	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	32099	100	time	scheduleQueuedTabReleaseFollowUp	scheduleQueuedTabReleaseFollowUp	arg		no	no	shared
+shared/js/sw.js	32225	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32549	20	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	32550	20	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	32551	20	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	32776	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32800	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32812	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32817	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32833	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32838	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32855	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	32916	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	33147	4000	time	scheduleOwnedBlockedProfileSweep	scheduleOwnedBlockedProfileSweep	arg		no	no	shared
+shared/js/sw.js	33280	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	33601	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	33652	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	33890	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	34287	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	35494	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	35535	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	35681	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	35767	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	35770	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	35792	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	35996	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	36146	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	36318	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	36389	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	36402	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	36420	750	time	scheduleOwnedBlockedProfileSweep	scheduleOwnedBlockedProfileSweep	arg		no	no	shared
+shared/js/sw.js	36436	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/sw.js	36441	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/sw.js	36596	250	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	36643	2	other	version		prop		no	no	shared
+shared/js/sw.js	37054	240	size	slice	slice	arg		no	no	shared
+shared/js/sw.js	37059	240	size	slice	slice	arg		no	no	shared
+shared/js/swBootstrap.js	421	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swBootstrap.js	442	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swBootstrap.js	445	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swBootstrap.js	501	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swBootstrap.js	811	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swBootstrap.js	828	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swBootstrap.js	990	40	size	slice	slice	arg		no	no	shared
+shared/js/swBootstrap.js	991	80	size	slice	slice	arg		no	no	shared
+shared/js/swBootstrap.js	992	200	size	slice	slice	arg		no	no	shared
+shared/js/swBootstrap.js	1153	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swBrowserSessionRuntime.js	156	1000	time	promiseWithTimeout	promiseWithTimeout	arg		no	no	shared
+shared/js/swBrowserSessionRuntime.js	176	1000	time	promiseWithTimeout	promiseWithTimeout	arg		no	no	shared
+shared/js/swBrowserSessionRuntime.js	190	1000	time	promiseWithTimeout	promiseWithTimeout	arg		no	no	shared
+shared/js/swBrowserSessionRuntime.js	240	5000	time	scheduleQueuedWorkerActionSurfaceCleanup	scheduleQueuedWorkerActionSurfaceCleanup	arg		no	no	shared
+shared/js/swBrowserSessionRuntime.js	297	1000	time	setTimeoutFn	setTimeoutFn	arg		no	no	shared
+shared/js/swBrowserSessionRuntime.js	303	1000	time	setTimeoutFn	setTimeoutFn	arg		no	no	shared
+shared/js/swContentPageStateProjection.js	251	2	other	(expr)		binary	<	no	no	shared
+shared/js/swContentPageStateProjection.js	252	2	other	(expr)		binary	<	no	no	shared
+shared/js/swCoordinatorAttemptIdentity.js	60	2	size	slice	slice	arg		no	no	shared
+shared/js/swCoordinatorAttemptIdentity.js	60	8	size	slice	slice	arg		no	no	shared
+shared/js/swCoordinatorContentQueueIndex.js	107	2	other	version		prop		no	no	shared
+shared/js/swCoordinatorExecutorClassification.js	77	4	count	DEFAULT_QUEUED_TAB_CONCURRENCY		decl		yes	no	shared
+shared/js/swCoordinatorJobEnvelope.js	334	500	size	slice	slice	arg		no	no	shared
+shared/js/swCoordinatorJobMilestoneBookkeeping.js	191	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swCoordinatorJobMilestoneBookkeeping.js	234	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swCoordinatorProgressReducer.js	94	1800000	time	PROFILE_ACTION_TIMING_SAMPLE_MAX_PLAUSIBLE_MS		decl		yes	no	shared
+shared/js/swCoordinatorQueueView.js	52	1800000	time	COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS		decl		yes	no	shared
+shared/js/swCoordinatorQueueView.js	73	2	other	getCoordinatorQueueViewSortRank		return		no	no	shared
+shared/js/swCoordinatorQueueView.js	74	3	other	getCoordinatorQueueViewSortRank		return		no	no	shared
+shared/js/swCoordinatorQueueView.js	75	4	other	getCoordinatorQueueViewSortRank		return		no	no	shared
+shared/js/swCoordinatorQueueView.js	76	5	other	getCoordinatorQueueViewSortRank		return		no	no	shared
+shared/js/swCoordinatorQueueView.js	168	100	size	slice	slice	arg		no	no	shared
+shared/js/swCoordinatorQueueView.js	184	100	count	sampleLimit		prop		no	no	shared
+shared/js/swCoordinatorQueueView.js	333	100	count	length		binary	>=	no	no	shared
+shared/js/swCoordinatorQueueView.js	348	100	count	sampleLimit		prop		no	no	shared
+shared/js/swCoordinatorRetryCandidates.js	115	2	count	retryLimit		default		no	no	shared
+shared/js/swCoordinatorSourceProvenance.js	168	500	size	slice	slice	arg		no	no	shared
+shared/js/swCoordinatorTerminalSettlement.js	191	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swexecutor.js	4	10000	time	createTimeoutMs		default		no	no	shared
+shared/js/swexecutor.js	76	5000	time	openUrlCommitTimeoutMs		default		no	no	shared
+shared/js/swexecutor.js	77	250	time	pollMs		default		no	no	shared
+shared/js/swExecutorEnqueueFailureClassification.js	184	240	size	slice	slice	arg		no	no	shared
+shared/js/swExecutorEnqueueFailureClassification.js	192	240	size	slice	slice	arg		no	no	shared
+shared/js/swFastExecutorDecisions.js	40	1000	size	max	max	arg		no	no	shared
+shared/js/swFastExecutorDecisions.js	67	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFastExecutorDecisions.js	116	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFastExecutorDecisions.js	119	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swFastExecutorDecisions.js	154	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFastExecutorDecisions.js	175	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	82	1000	size	max	max	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	148	500	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	179	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	182	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	244	500	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	281	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	284	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	309	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	312	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	343	1000	time	QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS		binary	+	no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	382	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	385	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	421	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	424	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	486	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	492	3	count	openFailureCount		binary	<=	no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	538	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	558	750	time	scheduleOwnedBlockedProfileSweep	scheduleOwnedBlockedProfileSweep	arg		no	no	shared
+shared/js/swFillQueuedTabsOnceDecisions.js	560	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swflightRecorder.js	30	240	count	FLIGHT_RECORDER_STRING_MAX		decl		yes	no	shared
+shared/js/swflightRecorder.js	31	500	count	FLIGHT_RECORDER_URL_MAX		decl		yes	no	shared
+shared/js/swflightRecorder.js	40	8	size	max	max	arg		no	no	shared
+shared/js/swflightRecorder.js	132	100	other	(expr)		logical		no	no	shared
+shared/js/swOwnedTabLifecycle.js	100	250	time	delayMs		default		no	no	shared
+shared/js/swOwnedTabLifecycle.js	108	3000	time	timeoutMs		default		no	no	shared
+shared/js/swProfileNukeProgress.js	174	2	other	version		prop		no	no	shared
+shared/js/swProfileNukeProgress.js	343	2	other	version		prop		no	no	shared
+shared/js/swProfileNukeProgress.js	386	2	other	version		prop		no	no	shared
+shared/js/swProfileProgressMerge.js	142	2	count	tab-opened		prop		no	no	shared
+shared/js/swProfileProgressMerge.js	143	3	other	awaiting-visibility		prop		no	no	shared
+shared/js/swProfileProgressMerge.js	144	4	time	page-ready		prop		no	no	shared
+shared/js/swProfileProgressMerge.js	145	5	other	retrying		prop		no	no	shared
+shared/js/swProfileProgressMerge.js	146	6	other	muting		prop		no	no	shared
+shared/js/swProfileProgressMerge.js	147	7	other	blocking		prop		no	no	shared
+shared/js/swProfileProgressMerge.js	148	8	other	unmuting		prop		no	no	shared
+shared/js/swProfileProgressMerge.js	149	9	other	unblocking		prop		no	no	shared
+shared/js/swProfileProgressMerge.js	439	-12	other	normalizeProgressPatch		CallExpression		no	no	shared
+shared/js/swProfileResolution.js	100	-12	count	mergeProfileProgressEvents		CallExpression		no	no	shared
+shared/js/swProfileResolution.js	182	3	count	length		binary	>=	no	no	shared
+shared/js/swProfileResolution.js	187	12	count	length		binary	<	no	no	shared
+shared/js/swProfileResolution.js	234	3	count	length		binary	>=	no	no	shared
+shared/js/swprojections.js	8	31	shard	hash		binary	*	no	no	shared
+shared/js/swQueueBarSummary.js	66	100	size	min	min	arg		no	no	shared
+shared/js/swQueueBarSummary.js	66	100	other	(expr)		binary	*	no	no	shared
+shared/js/swQueuedTabActionBookkeeping.js	137	500	time	delayMs		default		no	no	shared
+shared/js/swQueuedTabActionBookkeeping.js	144	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swQueuedTabActionBookkeeping.js	147	100	size	max	max	arg		no	no	shared
+shared/js/swQueuedTabActionBookkeeping.js	147	500	other	(expr)		logical		no	no	shared
+shared/js/swQueuedTabActiveTransitionDecisions.js	152	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swQueuedTabActiveTransitionDecisions.js	182	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swQueuedTabDetachSurfaceDedupe.js	178	1000000	threshold	score		assign		no	no	shared
+shared/js/swQueuedTabDetachSurfaceDedupe.js	179	100000	threshold	score		assign		no	no	shared
+shared/js/swQueuedTabDetachSurfaceDedupe.js	180	10000	threshold	score		assign		no	no	shared
+shared/js/swQueuedTabDetachSurfaceDedupe.js	181	999999	size	min	min	arg		no	no	shared
+shared/js/swQueuedTabDetachSurfaceDedupe.js	182	999999	size	min	min	arg		no	no	shared
+shared/js/swQueuedTabDetachSurfaceDedupe.js	182	1000000	other	(expr)		binary	/	no	no	shared
+shared/js/swQueuedTabExecutorPlan.js	71	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swQueuedTabExecutorPlan.js	74	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swQueuedWorkFastResume.js	126	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swQueuedWorkFastResume.js	156	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swQueuedWorkFastResume.js	180	100	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swQueuedWorkFastResume.js	183	100	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swQueueWakeupMetricsShape.js	26	50	time	MAX_QUEUE_WAKEUP_METRIC_PAUSE_WINDOWS		decl		yes	no	shared
+shared/js/swQueueWakeupMetricsShape.js	27	50	time	MAX_QUEUE_WAKEUP_METRIC_THROTTLE_WINDOWS		decl		yes	no	shared
+shared/js/swQueueWakeupMetricsShape.js	38	80	count	MAX_QUEUE_WAKEUP_METRIC_DIAGNOSTIC_EVENTS		decl		yes	no	shared
+shared/js/swQueueWakeupMetricsShape.js	94	2	size	slice	slice	arg		no	no	shared
+shared/js/swQueueWakeupMetricsShape.js	94	8	size	slice	slice	arg		no	no	shared
+shared/js/swQueueWakeupMetricsShape.js	358	2	other	(expr)		binary	**	no	no	shared
+shared/js/swQueueWakeupMetricsShape.js	445	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swQueueWakeupMetricsShape.js	850	-100	time	recordActiveStorageMetricPhaseInterval		CallExpression		no	no	shared
+shared/js/swQueueWakeupMetricsShape.js	901	240	size	slice	slice	arg		no	no	shared
+shared/js/swQueueWalDurableReads.js	36	50	count	limit		default		no	no	shared
+shared/js/swQueueWalDurableReads.js	37	50	other	(expr)		logical		no	no	shared
+shared/js/swQueueWalRecovery.js	90	240	size	slice	slice	arg		no	no	shared
+shared/js/swscheduler.js	160	6	size	min	min	arg		no	no	shared
+shared/js/swscheduler.js	163	2	other	(expr)		binary	**	no	no	shared
+shared/js/swSchedulerAlarmBookkeeping.js	470	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swSchedulerAlarmBookkeeping.js	485	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swstorage.js	178	1000	size	max	max	arg		no	no	shared
+shared/js/swstorage.js	178	1000	other	(expr)		logical		no	no	shared
+shared/js/swstorage.js	219	1000	size	max	max	arg		no	no	shared
+shared/js/swStorageIdlePromiseLatch.js	224	60	size	slice	slice	arg		no	no	shared
+shared/js/swStorageIdlePromiseLatch.js	330	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swStorageIdlePromiseLatch.js	333	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swStorageIdlePromiseLatch.js	373	1000	time	scheduleCoordinatorReconcile	scheduleCoordinatorReconcile	arg		no	no	shared
+shared/js/swStorageIdlePromiseLatch.js	461	1000	time	scheduleCoordinatorQueueResume	scheduleCoordinatorQueueResume	arg		no	no	shared
+shared/js/swStorageMetrics.js	138	80	size	slice	slice	arg		no	no	shared
+shared/js/swStorageMetrics.js	267	1024	other	createStorageMetrics		array		no	no	shared
+shared/js/swStorageMetrics.js	268	4096	other	createStorageMetrics		array		no	no	shared
+shared/js/swStorageMetrics.js	269	16384	other	createStorageMetrics		array		no	no	shared
+shared/js/swStorageMetrics.js	270	65536	other	createStorageMetrics		array		no	no	shared
+shared/js/swStorageMetrics.js	271	262144	other	createStorageMetrics		array		no	no	shared
+shared/js/swStorageMetrics.js	272	1048576	other	createStorageMetrics		array		no	no	shared
+shared/js/swStorageMetrics.js	273	4194304	other	createStorageMetrics		array		no	no	shared
+shared/js/swStorageMetrics.js	316	12	size	slice	slice	arg		no	no	shared
+shared/js/swStorageMetrics.js	350	12	size	slice	slice	arg		no	no	shared
+shared/js/walSnapshotStore.js	24	10	shard	CHECKPOINT_SHARD_DEFAULT_COUNT		decl		yes	no	shared
+shared/js/walSnapshotStore.js	42	2166136261	shard	hash		decl		no	no	shared
+shared/js/walSnapshotStore.js	45	16777619	other	imul	imul	arg		no	no	shared
+tools/build-chrome-dev.js	29	2	other	stringify	stringify	arg		no	no	tools
+tools/build-chrome-dev.js	38	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/activate-target.js	23	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/activate-target.js	31	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/activate-target.js	32	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/activate-target.js	42	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/active-queue-rows.js	21	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/active-queue-rows.js	103	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/active-queue-rows.js	105	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/analyze-recorder-report.js	113	30	size	slice	slice	arg		no	no	tools
+tools/cdp/analyze-recorder-report.js	122	2	other	exit	exit	arg		no	no	tools
+tools/cdp/analyze-recorder-report.js	125	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/audit-action-kinds.js	19	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/audit-action-kinds.js	87	25	size	slice	slice	arg		no	no	tools
+tools/cdp/audit-action-kinds.js	89	-25	other	auditActionKinds		CallExpression		no	no	tools
+tools/cdp/audit-action-kinds.js	91	-25	other	auditActionKinds		CallExpression		no	no	tools
+tools/cdp/audit-action-kinds.js	93	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/audit-action-kinds.js	95	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/cancel-current-work.js	19	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/cancel-current-work.js	39	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/cancel-current-work.js	53	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/check-checkpoint-codec.js	18	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/check-checkpoint-codec.js	39	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/check-checkpoint-codec.js	41	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/check-pause-button.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/check-pause-button.js	27	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/check-pause-button.js	29	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/claim-tab-action.js	20	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/claim-tab-action.js	66	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/claim-tab-action.js	68	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/clear-all-stats-dashboard.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/clear-all-stats-dashboard.js	28	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/clear-all-stats-dashboard.js	30	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/clear-coordinator-test-state.js	30	9222	other	MB_CDP_PORT		logical		no	no	tools
+tools/cdp/clear-coordinator-test-state.js	30	9222	other	(expr)		logical		no	no	tools
+tools/cdp/clear-coordinator-test-state.js	45	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/clear-coordinator-test-state.js	46	1500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/clear-coordinator-test-state.js	74	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/clear-coordinator-test-state.js	90	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/clear-extension-errors.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/clear-extension-errors.js	42	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-pause-current-work.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-pause-current-work.js	28	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/click-pause-current-work.js	30	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-profile-block-confirm.js	57	500	size	slice	slice	arg		no	no	tools
+tools/cdp/click-profile-block-confirm.js	70	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/click-profile-block-confirm.js	78	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-profile-extension-action.js	54	40	size	slice	slice	arg		no	no	tools
+tools/cdp/click-profile-extension-action.js	94	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-profile-extension-action.js	100	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/click-profile-extension-action.js	109	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-profile-mute-block-close.js	45	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/click-profile-mute-block-close.js	53	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-profile-mute-confirm.js	73	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/click-profile-mute-confirm.js	81	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-resume-current-work.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-resume-current-work.js	28	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/click-resume-current-work.js	30	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-space-nuke.js	54	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/click-space-nuke.js	70	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/click-space-nuke.js	78	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/click-space-nuke.js	93	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/click-space-nuke.js	102	2500	other	(expr)		logical		no	no	tools
+tools/cdp/click-space-nuke.js	109	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-space-nuke.js	119	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/click-space-nuke.js	125	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/click-space-nuke.js	132	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/close-extension-pages.js	24	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/close-extension-pages.js	32	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/close-profile-search-tabs.js	38	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/close-profile-search-tabs.js	51	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/close-profile-tabs.js	24	1500	other	cdpGet	cdpGet	arg		no	no	tools
+tools/cdp/close-profile-tabs.js	31	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/collect-profile-search.js	41	20	size	slice	slice	arg		no	no	tools
+tools/cdp/collect-profile-search.js	43	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/collect-profile-search.js	58	180000	other	(expr)		logical		no	no	tools
+tools/cdp/collect-profile-search.js	67	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/collect-profile-search.js	79	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/collect-profile-search.js	94	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/collect-profile-search.js	102	1500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/collect-profile-search.js	110	12	count	length		binary	>	no	no	tools
+tools/cdp/collect-profile-search.js	129	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/current-work-filter.js	15	20	other	(expr)		logical		no	no	tools
+tools/cdp/current-work-filter.js	22	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/current-work-filter.js	100	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/current-work-filter.js	102	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/dashboard-metrics-read.js	17	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/dashboard-metrics-read.js	22	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/dashboard-metrics-read.js	23	6000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/dashboard-metrics-read.js	38	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/dashboard-metrics-read.js	40	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/dashboard-state.js	18	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/dashboard-state.js	68	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/dump-storage-keys.js	30	2	other	exitCode		assign		no	no	tools
+tools/cdp/dump-storage-keys.js	37	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/dump-storage-keys.js	45	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/dump-storage-keys.js	56	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/enqueue-visible-profile-search.js	33	3	other	(expr)		logical		no	no	tools
+tools/cdp/enqueue-visible-profile-search.js	51	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/enqueue-visible-profile-search.js	56	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/enqueue-visible-profile-search.js	83	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/enqueue-visible-profile-search.js	94	15000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/enqueue-visible-profile-search.js	101	2	size	slice	slice	arg		no	no	tools
+tools/cdp/enqueue-visible-profile-search.js	101	8	size	slice	slice	arg		no	no	tools
+tools/cdp/enqueue-visible-profile-search.js	161	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/enqueue-visible-profile-search.js	167	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/export-profile-search-candidates.js	130	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/export-profile-search-candidates.js	131	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/export-profile-search-candidates.js	168	8	count	depth		binary	<	no	no	tools
+tools/cdp/export-profile-search-candidates.js	172	20	count	length		binary	>=	no	no	tools
+tools/cdp/export-profile-search-candidates.js	191	500	size	slice	slice	arg		no	no	tools
+tools/cdp/export-profile-search-candidates.js	202	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/export-profile-search-candidates.js	222	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/export-profile-search-candidates.js	223	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/extension-error-details.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/extension-error-details.js	30	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/extension-errors.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/extension-errors.js	47	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/extension-info.js	17	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/extension-info.js	24	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/extension-info.js	25	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/find-stale-profile-links-evidence.js	36	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/find-stale-profile-links-evidence.js	43	60000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/find-stale-profile-links-evidence.js	77	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/flight-recorder-audit.js	34	5000	other	(expr)		logical		no	no	tools
+tools/cdp/flight-recorder-audit.js	100	-20	count	analyzeEntries		CallExpression		no	no	tools
+tools/cdp/flight-recorder-audit.js	134	-20	count	analyzeEntries		CallExpression		no	no	tools
+tools/cdp/flight-recorder-audit.js	167	5000	time	timeoutMs		binary	+	no	no	tools
+tools/cdp/flight-recorder-audit.js	181	2000	other	(expr)		logical		no	no	tools
+tools/cdp/flight-recorder-audit.js	185	1000	size	max	max	arg		no	no	tools
+tools/cdp/flight-recorder-audit.js	185	10000	other	(expr)		logical		no	no	tools
+tools/cdp/flight-recorder-audit.js	186	5000	other	(expr)		logical		no	no	tools
+tools/cdp/flight-recorder-audit.js	200	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/flight-recorder.js	13	100	other	(expr)		logical		no	no	tools
+tools/cdp/flight-recorder.js	17	1000	size	max	max	arg		no	no	tools
+tools/cdp/flight-recorder.js	17	10000	other	(expr)		logical		no	no	tools
+tools/cdp/flight-recorder.js	45	5000	time	timeoutMs		binary	+	no	no	tools
+tools/cdp/flight-recorder.js	54	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/flight-recorder.js	63	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/flight-recorder.js	74	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/flight-recorder.js	83	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inject-content-script.js	20	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inject-content-script.js	52	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/inject-content-script.js	54	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-confirm-surfaces.js	47	400	size	slice	slice	arg		no	no	tools
+tools/cdp/inspect-confirm-surfaces.js	68	5	count	length		binary	<	no	no	tools
+tools/cdp/inspect-confirm-surfaces.js	82	12	size	slice	slice	arg		no	no	tools
+tools/cdp/inspect-confirm-surfaces.js	90	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/inspect-confirm-surfaces.js	99	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-messages-sender.js	5	180	count	limit		default		no	no	tools
+tools/cdp/inspect-messages-sender.js	19	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-messages-sender.js	148	260	other	textSnippet	textSnippet	arg		no	no	tools
+tools/cdp/inspect-messages-sender.js	152	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-queue-brief.js	43	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-queue-brief.js	62	20000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/inspect-queue-brief.js	114	45000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/inspect-queue-brief.js	131	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-queue-item-live.js	20	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-queue-item-live.js	32	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/inspect-queue-item-live.js	34	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-queue-item.js	16	10	other	(expr)		logical		no	no	tools
+tools/cdp/inspect-queue-item.js	25	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-queue-item.js	144	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/inspect-queue-item.js	146	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-recovered-queue-item.js	89	10	other	(expr)		logical		no	no	tools
+tools/cdp/inspect-recovered-queue-item.js	96	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-recovered-queue-item.js	103	60000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/inspect-recovered-queue-item.js	108	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/inspect-recovered-queue-item.js	161	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-space-state.js	45	32	other	i		binary	<	no	no	tools
+tools/cdp/inspect-space-state.js	49	2	other	(expr)		binary	!==	no	no	tools
+tools/cdp/inspect-space-state.js	51	32	other	i		binary	<	no	no	tools
+tools/cdp/inspect-space-state.js	125	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-sw-runtime-queue.js	18	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/inspect-sw-runtime-queue.js	57	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/inspect-sw-runtime-queue.js	59	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/launch-local-chrome.js	40	2	size	slice	slice	arg		no	no	tools
+tools/cdp/lib/cdp.js	5	9222	other	DEFAULT_PORT		decl		yes	no	tools
+tools/cdp/lib/cdp.js	34	30000	time	timeoutMs		default		no	no	tools
+tools/cdp/lib/cdp.js	47	30000	time	timeoutMs		default		no	no	tools
+tools/cdp/lib/cdp.js	72	1500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/lib/cdp.js	79	1500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/lib/cdp.js	100	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/lib/cdp.js	184	2	other	(expr)		ternary		no	no	tools
+tools/cdp/lib/cdp.js	188	1000	other	close	close	arg		no	no	tools
+tools/cdp/lib/cdp.js	188	120	size	slice	slice	arg		no	no	tools
+tools/cdp/lib/cdp.js	208	5000	time	timeoutMs		default		no	no	tools
+tools/cdp/lib/cdp.js	240	15000	time	timeoutMs		default		no	no	tools
+tools/cdp/lib/cdp.js	242	2	count	attempt		binary	<	no	no	tools
+tools/cdp/lib/cdp.js	249	250	time	sleep	sleep	arg		no	no	tools
+tools/cdp/lib/cdp.js	293	250	time	sleep	sleep	arg		no	no	tools
+tools/cdp/lib/cdp.js	305	20000	time	timeoutMs		default		no	no	tools
+tools/cdp/lib/cdp.js	307	2	count	attempt		binary	<	no	no	tools
+tools/cdp/lib/cdp.js	314	250	time	sleep	sleep	arg		no	no	tools
+tools/cdp/lib/cdp.js	363	250	time	sleep	sleep	arg		no	no	tools
+tools/cdp/lib/cdp.js	399	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/lib/cdp.js	415	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/lib/cdp.js	419	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/list-page-contexts.js	17	5000	time	timeoutMs		default		no	no	tools
+tools/cdp/list-page-contexts.js	24	1000	other	close	close	arg		no	no	tools
+tools/cdp/list-page-contexts.js	48	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/list-page-contexts.js	58	5000	time	timeoutMs		default		no	no	tools
+tools/cdp/list-page-contexts.js	87	1000	other	(expr)		logical		no	no	tools
+tools/cdp/list-page-contexts.js	99	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/list-page-contexts.js	103	1000	other	close	close	arg		no	no	tools
+tools/cdp/live-test-loop.js	22	30	other	(expr)		binary	*	no	no	tools
+tools/cdp/live-test-loop.js	22	1024	other	(expr)		binary	*	no	no	tools
+tools/cdp/live-test-loop.js	22	1024	other	(expr)		binary	*	no	no	tools
+tools/cdp/live-test-loop.js	41	-6000	other	summarize		CallExpression		no	no	tools
+tools/cdp/live-test-loop.js	42	-6000	other	summarize		CallExpression		no	no	tools
+tools/cdp/live-test-loop.js	72	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/live-test-loop.js	81	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/live-test-loop.js	99	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/live-test-loop.js	115	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/live-test-loop.js	136	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/live-test-loop.js	148	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/nudge-tab-action.js	20	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/nudge-tab-action.js	51	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/nudge-tab-action.js	53	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/open-dashboard.js	26	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/open-dashboard.js	36	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/open-dashboard.js	42	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/open-dashboard.js	54	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/open-queued-storage-tabs.js	29	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/open-queued-storage-tabs.js	38	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/open-queued-storage-tabs.js	108	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/open-queued-storage-tabs.js	110	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/open-url.js	22	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/open-url.js	23	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/pause-diagnostic-snapshot.js	17	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/pause-diagnostic-snapshot.js	30	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/pause-diagnostic-snapshot.js	32	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/pause-queue.js	18	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/pause-queue.js	41	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/pause-queue.js	43	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/pause-service-worker-stack.js	9	5000	time	timeoutMs		default		no	no	tools
+tools/cdp/pause-service-worker-stack.js	39	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/pause-service-worker-stack.js	49	10000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/pause-service-worker-stack.js	86	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/probe-extension-storage.js	35	5000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/probe-extension-storage.js	43	5000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/probe-extension-storage.js	68	7000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/probe-extension-storage.js	81	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/probe-inspect-options.js	15	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/probe-inspect-options.js	29	8	other	render_process_id		prop		no	no	tools
+tools/cdp/probe-inspect-options.js	29	12	other	render_view_id		prop		no	no	tools
+tools/cdp/probe-inspect-options.js	47	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/probe-inspect-options.js	49	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	23	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	75	980	other	width		prop		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	76	720	other	height		prop		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	77	80	other	left		prop		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	78	80	count	top		prop		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	80	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	83	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	90	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	100	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	108	250	time	sleep	sleep	arg		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	130	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/probe-isolated-worker-window.js	132	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/probe-resume.js	20	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/probe-resume.js	71	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/probe-resume.js	73	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-action-state.js	23	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-action-state.js	58	80	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-action-state.js	64	1000	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-action-state.js	68	40	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-action-state.js	71	20	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-action-state.js	75	1000	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-action-state.js	84	1500	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-action-state.js	89	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-action-state.js	98	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-controls.js	30	120	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-controls.js	42	160	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-controls.js	43	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-controls.js	55	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-page-state.js	24	80	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-page-state.js	32	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-page-state.js	50	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-search-controls.js	82	25	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-search-controls.js	85	30	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-search-controls.js	86	800	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-search-controls.js	92	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-controls.js	107	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/profile-search-controls.js	115	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/profile-search-controls.js	129	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-controls.js	138	1500	other	(expr)		logical		no	no	tools
+tools/cdp/profile-search-controls.js	143	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-search-controls.js	153	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-search-controls.js	159	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-controls.js	166	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-search-end-shape.js	42	180	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-search-end-shape.js	59	120	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-search-end-shape.js	60	120	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-search-end-shape.js	77	-15	other	inspectProfileSearchEndShape		CallExpression		no	no	tools
+tools/cdp/profile-search-end-shape.js	81	-10	other	inspectProfileSearchEndShape		CallExpression		no	no	tools
+tools/cdp/profile-search-end-shape.js	83	-1200	other	inspectProfileSearchEndShape		CallExpression		no	no	tools
+tools/cdp/profile-search-end-shape.js	91	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-end-shape.js	93	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-end-shape.js	94	900	time	sleep	sleep	arg		no	no	tools
+tools/cdp/profile-search-end-shape.js	95	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-end-shape.js	110	8	other	(expr)		logical		no	no	tools
+tools/cdp/profile-search-end-shape.js	115	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-search-end-shape.js	125	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	44	5	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	47	120	other	index		binary	-	no	no	tools
+tools/cdp/profile-search-eof-probe.js	47	120	other	(expr)		binary	+	no	no	tools
+tools/cdp/profile-search-eof-probe.js	58	100	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	63	100	size	slice	slice	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	88	-6	other	inspectProfileSearchEofProbe		CallExpression		no	no	tools
+tools/cdp/profile-search-eof-probe.js	90	-10	other	inspectProfileSearchEofProbe		CallExpression		no	no	tools
+tools/cdp/profile-search-eof-probe.js	95	-700	other	inspectProfileSearchEofProbe		CallExpression		no	no	tools
+tools/cdp/profile-search-eof-probe.js	101	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	116	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	122	35000	other	(expr)		logical		no	no	tools
+tools/cdp/profile-search-eof-probe.js	123	500	size	max	max	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	123	5000	other	(expr)		logical		no	no	tools
+tools/cdp/profile-search-eof-probe.js	132	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	137	10000	other	cdpGet	cdpGet	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	142	900	time	sleep	sleep	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	144	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	158	300	time	sleep	sleep	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	160	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	163	500	size	min	min	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	163	100	size	max	max	arg		no	no	tools
+tools/cdp/profile-search-eof-probe.js	171	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-accounting-audit.js	19	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-accounting-audit.js	29	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/queue-accounting-audit.js	39	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-counts.js	24	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-counts.js	60	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/queue-counts.js	67	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-failures.js	21	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-failures.js	65	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/queue-failures.js	67	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-storage-summary.js	26	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-storage-summary.js	129	80	size	slice	slice	arg		no	no	tools
+tools/cdp/queue-storage-summary.js	130	80	size	slice	slice	arg		no	no	tools
+tools/cdp/queue-storage-summary.js	131	40	size	slice	slice	arg		no	no	tools
+tools/cdp/queue-storage-summary.js	140	30000	other	includeFull		ternary		no	no	tools
+tools/cdp/queue-storage-summary.js	140	20000	other	includeFull		ternary		no	no	tools
+tools/cdp/queue-storage-summary.js	142	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-summary.js	19	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-summary.js	116	40	size	slice	slice	arg		no	no	tools
+tools/cdp/queue-summary.js	117	20	size	slice	slice	arg		no	no	tools
+tools/cdp/queue-summary.js	123	20	size	slice	slice	arg		no	no	tools
+tools/cdp/queue-summary.js	132	60	size	slice	slice	arg		no	no	tools
+tools/cdp/queue-summary.js	135	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/queue-summary.js	137	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-view-timing.js	17	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-view-timing.js	39	-10	other	(anon)		CallExpression		no	no	tools
+tools/cdp/queue-view-timing.js	43	5	size	slice	slice	arg		no	no	tools
+tools/cdp/queue-view-timing.js	73	-10	other	(anon)		CallExpression		no	no	tools
+tools/cdp/queue-view-timing.js	77	5	size	slice	slice	arg		no	no	tools
+tools/cdp/queue-view-timing.js	93	5000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/queue-view-timing.js	105	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/queue-view-timing.js	110	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	34	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/queue-wakeup-metrics.js	79	12	count	limit		default		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	196	12	count	topCounters	topCounters	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	205	20	count	topCounters	topCounters	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	207	20	count	topCounters	topCounters	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	209	20	count	topCounters	topCounters	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	211	20	count	topCounters	topCounters	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	220	30	count	topCounters	topCounters	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	271	-20	other	analyzeMetrics		CallExpression		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	306	5000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	336	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	383	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-wakeup-metrics.js	398	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-wakeup-tail.js	15	30	other	(expr)		logical		no	no	tools
+tools/cdp/queue-wakeup-tail.js	21	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/queue-wakeup-tail.js	51	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/queue-wakeup-tail.js	77	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reconcile-queue.js	18	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reconcile-queue.js	35	10000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/reconcile-queue.js	41	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/reconcile-queue.js	43	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/recover-queue-wal-from-raw.js	78	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/recover-queue-wal-from-raw.js	85	60000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/recover-queue-wal-from-raw.js	100	128	other	softSwitchAt		prop		no	no	tools
+tools/cdp/recover-queue-wal-from-raw.js	101	1024	count	hardSegmentLimit		prop		no	no	tools
+tools/cdp/recover-queue-wal-from-raw.js	119	60000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/recover-queue-wal-from-raw.js	138	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reload-chrome-dev.js	40	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/reload-chrome-dev.js	50	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/reload-chrome-dev.js	51	2500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/reload-chrome-dev.js	66	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/reload-chrome-dev.js	78	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reload-extension-pages.js	28	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reload-extension.js	70	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reload-extension.js	80	2500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/reload-extension.js	95	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reload-profile-search.js	37	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reload-profile-search.js	42	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/reload-profile-search.js	51	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reload-profile-tabs.js	40	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reload-space-tabs.js	25	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reload-windows-extension.js	40	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/reload-windows-extension.js	50	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/reload-windows-extension.js	51	2500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/reload-windows-extension.js	66	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/reload-windows-extension.js	78	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/requeue-failures.js	139	1000	size	max	max	arg		no	no	tools
+tools/cdp/requeue-failures.js	139	60000	other	(expr)		logical		no	no	tools
+tools/cdp/requeue-failures.js	146	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/requeue-failures.js	153	60000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/requeue-failures.js	173	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/requeue-failures.js	201	5000	time	messageTimeoutMs		binary	+	no	no	tools
+tools/cdp/requeue-failures.js	217	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/requeue-stale-active.js	28	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/requeue-stale-active.js	37	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/requeue-stale-active.js	75	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/requeue-stale-active.js	77	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reset-chrome-dev-tabs.js	51	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/reset-chrome-dev-tabs.js	59	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/reset-chrome-dev-tabs.js	79	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/reset-windows-tabs.js	51	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/reset-windows-tabs.js	59	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/reset-windows-tabs.js	79	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/resume-queue.js	11	4	count	MAX_ATTEMPTS		decl		yes	no	tools
+tools/cdp/resume-queue.js	12	1500	time	RETRY_DELAY_MS		decl		yes	no	tools
+tools/cdp/resume-queue.js	23	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/resume-queue.js	140	25000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/resume-queue.js	169	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/resume-queue.js	172	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/resume-queue.js	179	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/schedule-queue-alarm.js	24	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/schedule-queue-alarm.js	38	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/schedule-queue-alarm.js	60	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/schedule-queue-alarm.js	70	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/screenshot-tab.js	27	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/search-dashboard-text.js	18	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/search-dashboard-text.js	31	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/search-dashboard-text.js	33	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/send-extension-message-json.js	24	1000	size	max	max	arg		no	no	tools
+tools/cdp/send-extension-message-json.js	24	60000	other	(expr)		logical		no	no	tools
+tools/cdp/send-extension-message-json.js	27	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/send-extension-message-json.js	41	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/send-extension-message-json.js	70	5000	time	timeoutMs		binary	+	no	no	tools
+tools/cdp/send-extension-message-json.js	80	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/send-extension-message.js	14	1000	size	max	max	arg		no	no	tools
+tools/cdp/send-extension-message.js	14	60000	other	(expr)		logical		no	no	tools
+tools/cdp/send-extension-message.js	17	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/send-extension-message.js	28	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/send-extension-message.js	57	5000	time	timeoutMs		binary	+	no	no	tools
+tools/cdp/send-extension-message.js	59	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/space-contributors.js	54	120	size	slice	slice	arg		no	no	tools
+tools/cdp/space-contributors.js	59	20	other	clientHeight		binary	+	no	no	tools
+tools/cdp/space-contributors.js	74	300	size	slice	slice	arg		no	no	tools
+tools/cdp/space-contributors.js	77	20	size	slice	slice	arg		no	no	tools
+tools/cdp/space-contributors.js	117	300	size	slice	slice	arg		no	no	tools
+tools/cdp/space-contributors.js	124	15000	time	timeoutMs		default		no	no	tools
+tools/cdp/space-contributors.js	130	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/space-contributors.js	141	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/space-contributors.js	156	20000	time	waitFor	waitFor	arg		no	no	tools
+tools/cdp/space-contributors.js	161	5000	time	waitFor	waitFor	arg		no	no	tools
+tools/cdp/space-contributors.js	164	5000	time	waitFor	waitFor	arg		no	no	tools
+tools/cdp/space-contributors.js	174	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/space-summary.js	52	32	other	i		binary	<	no	no	tools
+tools/cdp/space-summary.js	56	2	other	(expr)		binary	!==	no	no	tools
+tools/cdp/space-summary.js	58	32	other	i		binary	<	no	no	tools
+tools/cdp/space-summary.js	114	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/start-service-worker.js	21	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/start-service-worker.js	29	1500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/start-service-worker.js	33	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/start-windows-debug-browser.js	18	9222	other	remotePort		prop		no	no	tools
+tools/cdp/start-windows-debug-browser.js	25	2	other	index		decl		no	no	tools
+tools/cdp/start-windows-debug-browser.js	120	9223	other	localPort		prop		no	no	tools
+tools/cdp/start-windows-debug-browser.js	131	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/start-windows-debug-browser.js	138	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/storage-footprint.js	48	102.4	count	bytes		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	48	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	57	102.4	count	totalBytes		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	57	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	58	104857.6	count	totalBytes		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	58	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	71	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/storage-footprint.js	89	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/storage-footprint.js	97	102.4	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	97	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	111	102.4	count	nativeBytesInUse		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	111	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	114	104857.6	count	nativeBytesInUse		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	114	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-footprint.js	117	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/storage-read-profile.js	50	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/storage-read-profile.js	87	32	count	length		prop		no	no	tools
+tools/cdp/storage-read-profile.js	89	2	other	(expr)		binary	!==	no	no	tools
+tools/cdp/storage-read-profile.js	101	10	time	durationMs		binary	*	no	no	tools
+tools/cdp/storage-read-profile.js	101	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-read-profile.js	116	10	time	durationMs		binary	*	no	no	tools
+tools/cdp/storage-read-profile.js	116	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-read-profile.js	127	10	time	durationMs		binary	*	no	no	tools
+tools/cdp/storage-read-profile.js	127	10	other	(expr)		binary	/	no	no	tools
+tools/cdp/storage-read-profile.js	135	45000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/storage-read-profile.js	147	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-pause-and-close-profile-tabs.js	17	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-pause-and-close-profile-tabs.js	43	15000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/sw-pause-and-close-profile-tabs.js	54	15000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/sw-pause-and-close-profile-tabs.js	70	15000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/sw-pause-and-close-profile-tabs.js	85	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/sw-pause-and-close-profile-tabs.js	87	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-queue-summary.js	21	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-queue-summary.js	115	20	size	slice	slice	arg		no	no	tools
+tools/cdp/sw-queue-summary.js	116	20	size	slice	slice	arg		no	no	tools
+tools/cdp/sw-queue-summary.js	118	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/sw-queue-summary.js	120	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-runtime-state.js	18	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-runtime-state.js	51	5000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/sw-runtime-state.js	53	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-send-extension-message.js	14	1000	size	max	max	arg		no	no	tools
+tools/cdp/sw-send-extension-message.js	14	30000	other	(expr)		logical		no	no	tools
+tools/cdp/sw-send-extension-message.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-send-extension-message.js	26	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-send-extension-message.js	55	5000	time	timeoutMs		binary	+	no	no	tools
+tools/cdp/sw-send-extension-message.js	57	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	27	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	46	5000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	61	5000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	77	5000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	99	300	size	slice	slice	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	101	7000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	117	7000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	130	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/sw-tab-action-by-id.js	132	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/tab-action-by-id.js	16	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/tab-action-by-id.js	27	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/tab-action-by-id.js	46	5000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/tab-action-by-id.js	61	5000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/tab-action-by-id.js	79	5000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/tab-action-by-id.js	99	5000	time	withTimeout	withTimeout	arg		no	no	tools
+tools/cdp/tab-action-by-id.js	117	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/tab-action-by-id.js	119	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/target-breakdown.js	14	90	size	slice	slice	arg		no	no	tools
+tools/cdp/target-breakdown.js	17	25	size	slice	slice	arg		no	no	tools
+tools/cdp/target-breakdown.js	18	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/target-summary.js	14	80	size	slice	slice	arg		no	no	tools
+tools/cdp/target-summary.js	31	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/upgrade-regression/cleanup-artifacts.js	24	10	other	keep		prop		no	no	tools
+tools/cdp/upgrade-regression/cleanup-artifacts.js	68	1024	other	value		binary	>=	no	no	tools
+tools/cdp/upgrade-regression/cleanup-artifacts.js	69	1024	other	value		assign		no	no	tools
+tools/cdp/upgrade-regression/cleanup-artifacts.js	76	2	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	28	9222	other	DEFAULT_PORT		decl		yes	no	tools
+tools/cdp/upgrade-regression/run.js	87	180000	time	PHASE10_HARNESS_WATCHDOG_MS		decl		yes	no	tools
+tools/cdp/upgrade-regression/run.js	88	180000	time	PHASE10_TARGET_SELECTION_TIMEOUT_MS		decl		yes	no	tools
+tools/cdp/upgrade-regression/run.js	89	2000	count	PHASE10_FLIGHT_RECORDER_LIMIT		decl		yes	no	tools
+tools/cdp/upgrade-regression/run.js	253	120000	time	phase8TimeoutMs		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	254	3	count	phase9TargetCount		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	255	600000	time	phase9TimeoutMs		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	256	10	count	phase10TargetCount		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	257	1200000	time	phase10TimeoutMs		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	259	2	count	phase10Concurrency		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	260	20000	time	phase10IdleMs		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	261	20	count	phase10SearchAttemptLimit		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	270	2	other	index		decl		no	no	tools
+tools/cdp/upgrade-regression/run.js	365	3	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	365	3	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	365	5	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	368	10	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	368	300	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	369	2	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	369	3	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	370	5000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	370	20000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	370	60000	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	371	20	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	371	20	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	372	30000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	372	900000	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	490	10	count	targetCount		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	519	25	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	562	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	564	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	586	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	625	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	627	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	652	200	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	656	5000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	669	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	671	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	687	5000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	721	50	count	attempts		binary	>	no	no	tools
+tools/cdp/upgrade-regression/run.js	722	20	time	setInterval	setInterval	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	724	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	727	10000	time	timeoutMs		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	752	5000	time	timeoutMs		binary	+	no	no	tools
+tools/cdp/upgrade-regression/run.js	759	2000	count	limit		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	761	10000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	774	10000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	787	15000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	800	15000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	903	20000	time	idleMs		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	906	1000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	906	20000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	909	200	count	limit		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	915	1000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	915	20000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	951	20	count	attempts		binary	<	no	no	tools
+tools/cdp/upgrade-regression/run.js	952	100	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	978	3000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	1014	60000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	1033	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	1049	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	1232	-8	other	summarizeAuthorityState		CallExpression		no	no	tools
+tools/cdp/upgrade-regression/run.js	1382	240	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	1550	140	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	1970	-100	other	buildPhase10ArtifactReport		CallExpression		no	no	tools
+tools/cdp/upgrade-regression/run.js	1991	123	count	tabId		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	2006	2	count	attemptNumber		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	2007	2000	other	updatedAt		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	2014	123	count	tabId		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	2015	1000	other	updatedAt		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	2019	2	other	nextSeq		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	2037	123	count	tabId		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	2049	2	other	newestSeq		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	2050	2	other	seq		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	2107	5000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2380	20	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2749	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2751	4000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2774	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2776	4500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2859	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2886	2	other	(expr)		ternary		no	no	tools
+tools/cdp/upgrade-regression/run.js	2890	1000	other	close	close	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2890	120	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2898	15000	time	timeoutMs		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	2928	5000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2961	5000	time	send	send	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	2962	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3024	5000	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3033	100	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3060	20	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3062	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3067	5000	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3086	250	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3093	5	count	depth		binary	<	no	no	tools
+tools/cdp/upgrade-regression/run.js	3099	160	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3101	240	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3113	160	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3124	12	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3134	160	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3135	160	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3146	40	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3233	15000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3251	60000	time	evaluateInExtensionIsolatedWorld	evaluateInExtensionIsolatedWorld	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3359	20000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3378	5	count	attempt		binary	<	no	no	tools
+tools/cdp/upgrade-regression/run.js	3379	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3387	1500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3438	4	count	attempt		binary	<	no	no	tools
+tools/cdp/upgrade-regression/run.js	3441	400	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3441	800	other	innerHeight		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	3442	5000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3443	2000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3518	45000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	3530	15000	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3532	8	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3558	8	count	desiredEnabledCount		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	3558	45000	time	timeoutMs		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	3575	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3604	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3619	1500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3629	12	count	length		binary	>	no	no	tools
+tools/cdp/upgrade-regression/run.js	3655	20	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	3656	30000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3688	30	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3708	15000	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3710	8	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3751	5000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3751	25000	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3767	5000	time	attemptTimeoutMs		binary	+	no	no	tools
+tools/cdp/upgrade-regression/run.js	3777	5000	time	attemptTimeoutMs		binary	+	no	no	tools
+tools/cdp/upgrade-regression/run.js	3934	20	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3947	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3993	2	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	3993	8	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4007	2	count	maxRetries		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	4021	3	count	attempt		binary	<=	no	no	tools
+tools/cdp/upgrade-regression/run.js	4022	30000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4082	2	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4082	8	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4102	2	count	maxRetries		prop		no	no	tools
+tools/cdp/upgrade-regression/run.js	4117	3	count	attempt		binary	<=	no	no	tools
+tools/cdp/upgrade-regression/run.js	4118	30000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4158	3	count	count		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	4220	30	size	slice	slice	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4222	3	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	4222	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4243	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4252	1500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4280	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4313	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4328	15000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4332	15000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4339	15000	time	timeoutMs		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	4340	1000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4340	15000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	4345	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4361	120000	time	timeoutMs		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	4362	5000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4362	120000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	4379	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4490	20000	time	timeoutMs		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	4491	1000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4491	20000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	4511	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4530	240000	time	timeoutMs		default		no	no	tools
+tools/cdp/upgrade-regression/run.js	4531	5000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4531	240000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	4532	5000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4532	30000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	4635	1000	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4734	10000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4752	20000	time	waitForOneQueueRow	waitForOneQueueRow	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4761	20000	time	waitForOneQueueRow	waitForOneQueueRow	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4768	10000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4774	30000	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4774	5000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4774	120000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	4775	40000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4792	20000	time	waitForOneQueueRow	waitForOneQueueRow	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4893	60000	other	(expr)		binary	+	no	no	tools
+tools/cdp/upgrade-regression/run.js	4961	10000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	4972	10000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5055	10000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5193	120000	time	waitForSelectedQueuedRows	waitForSelectedQueuedRows	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5336	15000	time	waitForSelectedQueuedRows	waitForSelectedQueuedRows	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5436	30000	time	waitForSelectedQueuedRows	waitForSelectedQueuedRows	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5460	30000	time	waitForSelectedQueuedRows	waitForSelectedQueuedRows	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5475	10000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5483	60000	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5483	10000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5483	240000	other	(expr)		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	5484	70000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5498	15000	size	max	max	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5498	30000	time	idleMs		logical		no	no	tools
+tools/cdp/upgrade-regression/run.js	5498	60000	size	min	min	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5677	30000	time	waitForSelectedTerminalRows	waitForSelectedTerminalRows	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5801	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5806	10	count	attempt		binary	<	no	no	tools
+tools/cdp/upgrade-regression/run.js	5807	400	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5822	10000	time	cdpCommand	cdpCommand	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5823	4500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5908	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5913	15	count	attempt		binary	<	no	no	tools
+tools/cdp/upgrade-regression/run.js	5914	400	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	5980	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6005	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6026	5000	other	getJson	getJson	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6084	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6096	5000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6101	10000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6109	15000	time	sendRuntimeMessage	sendRuntimeMessage	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6128	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6132	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6136	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6140	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6152	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6156	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6160	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6164	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6168	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6172	500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/upgrade-regression/run.js	6349	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/wake-service-worker.js	17	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/wake-service-worker.js	51	10000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/wake-service-worker.js	53	1500	time	sleep	sleep	arg		no	no	tools
+tools/cdp/wake-service-worker.js	58	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/wal-records-for-key.js	57	50	other	(expr)		logical		no	no	tools
+tools/cdp/wal-records-for-key.js	64	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/wal-records-for-key.js	71	60000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/wal-records-for-key.js	104	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	49	9	size	min	min	arg		no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	61	1000000	other	(expr)		binary	/	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	64	2	other	digits		default		no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	65	10	other	digits		binary	**	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	96	1024	count	rawBytes		binary	/	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	98	1024	count	compressedBytes		binary	/	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	100	1024	count	base64Bytes		binary	/	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	102	1024	count	checkpointBytes		binary	/	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	103	100	other	(expr)		binary	*	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	104	100	other	(expr)		binary	*	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	105	100	other	(expr)		binary	*	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	106	2	other	round	round	arg		no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	107	2	other	round	round	arg		no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	127	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	143	2	other	(expr)		binary	!==	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	145	32	other	i		binary	<	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	171	20	other	(expr)		logical		no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	197	1024	count	nativeBytesInUse		binary	/	no	no	tools
+tools/cdp/wal-snapshot-benchmark.js	202	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/why-not-running.js	22	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/why-not-running.js	46	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/why-not-running.js	55	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/window-focus-summary.js	19	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/window-focus-summary.js	32	5000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/cdp/window-focus-summary.js	72	30000	time	evaluate	evaluate	arg		no	no	tools
+tools/cdp/window-focus-summary.js	74	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/windows-chrome-profile.js	5	9224	other	DEFAULT_REMOTE_PORT		decl		yes	no	tools
+tools/cdp/windows-chrome-profile.js	6	9224	other	DEFAULT_LOCAL_PORT		decl		yes	no	tools
+tools/cdp/windows-chrome-profile.js	24	2	other	index		decl		no	no	tools
+tools/cdp/windows-chrome-profile.js	71	65536	other	port		binary	<	no	no	tools
+tools/cdp/windows-chrome-profile.js	219	2	other	stringify	stringify	arg		no	no	tools
+tools/cdp/windows-chrome-profile.js	226	2	other	stringify	stringify	arg		no	no	tools
+tools/dev/text-replace.js	69	2	size	slice	slice	arg		no	no	tools
+tools/firefox-bidi/extract-mblock.js	12	10000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/extract-mblock.js	20	30000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/extract-mblock.js	53	15000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/extract-mblock.js	79	2	other	stringify	stringify	arg		no	no	tools
+tools/firefox-bidi/install-extension.js	20	30000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/install-extension.js	29	2	other	stringify	stringify	arg		no	no	tools
+tools/firefox-bidi/lib/bidi.js	2	9224	other	DEFAULT_PORT		decl		yes	no	tools
+tools/firefox-bidi/lib/bidi.js	26	5000	other	(expr)		logical		no	no	tools
+tools/firefox-bidi/lib/bidi.js	44	5000	time	timeoutMs		default		no	no	tools
+tools/firefox-bidi/lib/bidi.js	88	15000	time	timeoutMs		default		no	no	tools
+tools/firefox-bidi/lib/bidi.js	112	5000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/lib/bidi.js	154	5000	other	(expr)		logical		no	no	tools
+tools/firefox-bidi/lib/bidi.js	176	2	other	stringify	stringify	arg		no	no	tools
+tools/firefox-bidi/mock-smoke.js	18	10000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/mock-smoke.js	26	30000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/mock-smoke.js	37	15000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/mock-smoke.js	107	1000	time	sleep	sleep	arg		no	no	tools
+tools/firefox-bidi/mock-smoke.js	131	2	other	stringify	stringify	arg		no	no	tools
+tools/firefox-bidi/open-url.js	15	10000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/open-url.js	23	30000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/open-url.js	33	2	other	stringify	stringify	arg		no	no	tools
+tools/firefox-bidi/target-summary.js	26	5000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/target-summary.js	37	10000	time	send	send	arg		no	no	tools
+tools/firefox-bidi/target-summary.js	65	2	other	stringify	stringify	arg		no	no	tools
+tools/lint-correctness.js	5	2	size	slice	slice	arg		no	no	tools
+tools/lint-correctness.js	57	2022	other	ecmaVersion		prop		no	no	tools
+tools/lint-no-outside-writes.js	36	120	size	slice	slice	arg		no	no	tools
+tools/lint-queue-storage-layering.js	74	2	other	stringify	stringify	arg		no	no	tools
+tools/mock-quora/make-dev-firefox-extension.js	50	4	other	stringify	stringify	arg		no	no	tools
+tools/mock-quora/make-dev-firefox-extension.js	62	2	other	stringify	stringify	arg		no	no	tools
+tools/mock-quora/server.js	4	8765	other	(expr)		logical		no	no	tools
+tools/mock-quora/server.js	61	2	other	stringify	stringify	arg		no	no	tools
+tools/mock-quora/server.js	86	200	other	writeHead	writeHead	arg		no	no	tools
+tools/mock-quora/server.js	90	2	other	stringify	stringify	arg		no	no	tools
+tools/mock-quora/server.js	214	1024	other	(expr)		binary	*	no	no	tools
+tools/mock-quora/server.js	214	1024	other	(expr)		binary	*	no	no	tools
+tools/mock-quora/server.js	229	302	other	writeHead	writeHead	arg		no	no	tools
+tools/mock-quora/server.js	235	200	time	send	send	arg		no	no	tools
+tools/mock-quora/server.js	245	200	time	send	send	arg		no	no	tools
+tools/mock-quora/server.js	260	200	time	send	send	arg		no	no	tools
+tools/mock-quora/server.js	274	400	other	writeHead	writeHead	arg		no	no	tools
+tools/mock-quora/server.js	281	120	size	slice	slice	arg		no	no	tools
+tools/mock-quora/server.js	289	404	time	send	send	arg		no	no	tools
+tools/mock-quora/server.js	294	500	other	writeHead	writeHead	arg		no	no	tools
+tools/mock-quora/smoke.js	9	5000	time	setTimeout	setTimeout	arg		no	no	tools
+tools/mock-quora/smoke.js	32	200	size	slice	slice	arg		no	no	tools
+tools/mock-quora/smoke.js	108	2	other	stringify	stringify	arg		no	no	tools
+tools/mock-quora/smoke.js	119	2	other	stringify	stringify	arg		no	no	tools
+tools/mock-quora/validate-shared-moderation-fixtures.js	112	2	other	stringify	stringify	arg		no	no	tools
+tools/run-tests-parallel.js	8	30000	time	DEFAULT_COMMAND_TIMEOUT_MS		decl		yes	no	tools
+tools/run-tests-parallel.js	9	5000	time	KILL_GRACE_MS		decl		yes	no	tools
+tools/run-tests-parallel.js	10	48	shard	DEFAULT_SYNTHETIC_SHARDS		decl		yes	no	tools
+tools/run-tests-parallel.js	15	30000	time	commandTimeoutMs		prop		no	no	tools
+tools/run-tests-parallel.js	44	60000	time	commandTimeoutMs		prop		no	no	tools
+tools/run-tests-parallel.js	55	30000	time	commandTimeoutMs		prop		no	no	tools
+tools/run-tests-parallel.js	75	1200000	time	commandTimeoutMs		prop		no	no	tools
+tools/run-tests-parallel.js	80	300000	time	commandTimeoutMs		prop		no	no	tools
+tools/run-tests-parallel.js	88	30000	time	commandTimeoutMs		prop		no	no	tools
+tools/run-tests-parallel.js	165	1200000	time	commandTimeoutMs		prop		no	no	tools
+tools/run-tests-parallel.js	178	1000	time	ms		binary	<	no	no	tools
+tools/run-tests-parallel.js	189	4	size	min	min	arg		no	no	tools

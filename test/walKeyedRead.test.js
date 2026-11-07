@@ -420,6 +420,39 @@ register('a null resident copy refuses without touching the store, so the caller
     assert.equal(fromStorage.ok, true)
 })
 
+register('keyed read plan asks for the meta key and extra defaults, then the row keys of the active slot', () => {
+    const plan = wal.planKeyedRowReads(null, ['k1'], {
+        baseKey: BASE,
+        metaKey: `${BASE}.meta`,
+        extraDefaults: {'extra.one': 0}
+    })
+    assert.equal(plan[`${BASE}.meta`], null)
+    assert.equal(plan['extra.one'], 0)
+    assert.deepEqual(Object.keys(plan).sort(), [`${BASE}.meta`, 'extra.one'].sort())
+})
+
+register('keyed projection of an empty snapshot returns no rows and no failure', () => {
+    assert.deepEqual(wal.projectKeyedRows({}, [], {baseKey: BASE}), {ok: true, reason: '', rows: {}})
+})
+
+register('keyed projection reports the first row reason it cannot project, without partial rows', () => {
+    const result = wal.projectKeyedRows({}, ['', 'never-read'], {baseKey: BASE})
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'missing-area-or-key')
+    assert.deepEqual(result.rows, {})
+})
+
+register('the queue WAL sequence fingerprint is equal for identical meta and differs when nextSeq moves', () => {
+    const {store} = makeScenario(90)
+    const payload = wal.buildSegmentedWalStoragePayload(store, {baseKey: BASE, writeCheckpoints: true})
+    const meta = payload[wal.getSegmentedWalMetaKey(BASE)]
+    const copy = JSON.parse(JSON.stringify(meta))
+    const advanced = {...copy, nextSeq: Number(meta.nextSeq) + 1}
+    assert.equal(wal.getQueueWalSeqFingerprint(meta), wal.getQueueWalSeqFingerprint(copy))
+    assert.notEqual(wal.getQueueWalSeqFingerprint(meta), wal.getQueueWalSeqFingerprint(advanced))
+    assert.equal(wal.getQueueWalSeqFingerprint(null), null)
+})
+
 ;(async () => {
     for (const [name, fn] of cases) await run(name, fn)
 })().catch(() => {

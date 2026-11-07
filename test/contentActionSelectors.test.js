@@ -236,7 +236,7 @@ function loadSelectorHarness(document) {
         extractFunction(source, 'function getUnmuteConfirmContainer()'),
         extractFunction(source, 'function isUnmuteConfirmContextText(text)'),
         extractFunction(source, 'function getUnmuteConfirmCandidates()'),
-        extractFunction(source, 'function getInPageConfirmPairAction(preferredRegex)'),
+        extractFunction(source, 'function getInPageConfirmPairAction(preferredRegex, options = {})'),
         `globalThis.harness = {
             isMuteActionLabel,
             isUnmuteActionLabel,

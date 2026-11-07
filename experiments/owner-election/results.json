@@ -1,0 +1,17 @@
+{
+  "beforeClose": {
+    "holderAcquired": true,
+    "waiterAAcquired": false,
+    "waiterBAcquired": false
+  },
+  "afterClose": {
+    "waiterAAcquired": true,
+    "waiterBAcquired": false,
+    "exactlyOneWaiterAcquired": true,
+    "handoverMs": 5
+  },
+  "lateHolder": {
+    "acquired": false,
+    "ifAvailableResult": "not-available"
+  }
+}

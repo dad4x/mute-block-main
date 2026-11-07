@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+const {STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
+// The --keys names are plain key names. Each one is read under its stored name: the layout prefix plus the plain name (storageNamespace.js).
+// The values come back under the plain names.
+
 const {
     evaluate,
     getCdpConfig,
@@ -39,10 +44,10 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(target.webSocketDebuggerUrl, `(${async function dumpKeys(keysToRead) {
-        const stored = await chrome.storage.local.get(Object.fromEntries(keysToRead.map(key => [key, null])))
-        return Object.fromEntries(keysToRead.map(key => [key, stored?.[key] ?? null]))
-    }})( ${JSON.stringify(keys)} )`, 30000)
+    const result = await evaluate(target.webSocketDebuggerUrl, `(${async function dumpKeys(keysToRead, layoutPrefix) {
+        const stored = await chrome.storage.local.get(Object.fromEntries(keysToRead.map(key => [layoutPrefix + key, null])))
+        return Object.fromEntries(keysToRead.map(key => [key, stored?.[layoutPrefix + key] ?? null]))
+    }})( ${JSON.stringify(keys)}, ${JSON.stringify(STORAGE_LAYOUT_PREFIX)} )`, 30000)
 
     console.log(JSON.stringify({
         extensionTarget: true,

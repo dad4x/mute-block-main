@@ -1,5 +1,7 @@
 # Queue Wakeup Metrics Analysis Playbook
 
+> **Status: REFERENCE** (24 Oct 2026). Playbook for reading the wake-up metrics (20 May). Counter names need a refresh. Reference or dated data. Check before relying on its numbers. Register: [notes register](docs/notes-register.md).
+
 Date: 2026-05-20
 
 Status: supporting analysis playbook.
@@ -18,7 +20,7 @@ to the authority model rather than to raw wakeup volume alone.
 Related notes:
 
 - `queue-wakeup-metrics-model-2026-05-20.md`
-- `reconciler-first-fallback-architecture-2026-05-20.md`
+- `historical/reconciler-first-fallback-architecture-2026-05-20.md`
 
 ## Collection Command
 
@@ -156,7 +158,7 @@ Critical:
 4. Check whether repair is becoming the real scheduler.
 
    If ordinary success usually needs repair to converge, use
-   `reconciler-first-fallback-architecture-2026-05-20.md` as the migration
+   `historical/reconciler-first-fallback-architecture-2026-05-20.md` as the migration
    guide rather than adding more local patches.
 
 5. Classify extra wakeups before removing them.

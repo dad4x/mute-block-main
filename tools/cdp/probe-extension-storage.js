@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+const {QUEUE_WAKEUP_METRICS_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
 const {
     evaluate,
     getCdpConfig,
@@ -9,11 +11,13 @@ const {
     runMain
 } = require('./lib/cdp')
 
-const DEFAULT_KEY = 'mbQueueWakeupMetrics'
+const DEFAULT_KEY = QUEUE_WAKEUP_METRICS_KEY
 
 runMain(async () => {
     const config = await resolveCdpConfig(getCdpConfig())
     const key = getOption('key', DEFAULT_KEY)
+    // The stored name of the key: the layout prefix plus the plain name (storageNamespace.js).
+    const storedKey = `${STORAGE_LAYOUT_PREFIX}${key}`
     const targets = await getTargets(config)
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
     const candidates = targets.filter(target =>
@@ -65,7 +69,7 @@ runMain(async () => {
                     })
                 }
             })
-        }})(${JSON.stringify(key)})`, 7000).catch(error => ({error: error.message}))
+        }})(${JSON.stringify(storedKey)})`, 7000).catch(error => ({error: error.message}))
 
         results.push({
             id: target.id,

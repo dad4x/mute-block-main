@@ -1,0 +1,25 @@
+[
+  {
+    "probe": "idbKeepalive",
+    "requestedSeconds": 60,
+    "bootId": "bff025d9-1d51-4314-8708-4feaf6e7d6bb",
+    "killedAfterMs": 30128,
+    "finishedMs": null,
+    "workerTargetCount": {
+      "min": 0,
+      "max": 1
+    },
+    "lastHeartbeatAt": 1791778063892,
+    "pingAtEnd": {
+      "bootId": "603ef1b3-39ea-4f03-8fa7-a32b4ecfdd81",
+      "counters": {
+        "idbSteps": 0,
+        "timerTicks": 0,
+        "idbError": null,
+        "lastStepAt": null,
+        "now": 1791778114012
+      }
+    },
+    "marker": null
+  }
+]

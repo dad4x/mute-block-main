@@ -1,3 +1,5 @@
+const {storedProfileHref} = require('./subject')
+
 // Coordinator executor-classification/runtime-surface helpers extracted
 // from sw.js (decomposition Slice 26): getCoordinatorItemHref (127 external
 // refs before this move -- the second-highest fan-in of anything claimed by
@@ -96,27 +98,35 @@ function createCoordinatorExecutorClassification(deps = {}) {
     } = deps.state || {}
 
     function getCoordinatorItemHref(item = {}) {
-        return normalizeQuoraProfileUrl(item?.targetProfileHref || item?.requestedUrl || item?.dedupeKey || '')
+        // A stored target is canonical, so it is read as it is; a raw request is normalized once (1 Nov).
+        if(item?.targetProfileHref) return storedProfileHref(item.targetProfileHref)
+        return normalizeQuoraProfileUrl(item?.requestedUrl || item?.dedupeKey || '')
     }
 
     function findCoordinatorQueueEntryForHref(queue = {}, href = '') {
-        const normalizedHref = normalizeQuoraProfileUrl(href)
-        if(!normalizedHref) return null
+        // A stored target is canonical and is matched as it is; a raw href is normalized once (1 Nov). The stored reading is tried first, and
+        // the normalized reading second, so a raw tab URL still finds its row.
+        const candidates = [...new Set([storedProfileHref(href), normalizeQuoraProfileUrl(href)].filter(Boolean))]
+        if(!candidates.length) return null
 
-        if(queue?.[normalizedHref]) {
-            return {
-                key: normalizedHref,
-                item: queue[normalizedHref]
+        for(const candidate of candidates) {
+            if(queue?.[candidate]) {
+                return {
+                    key: candidate,
+                    item: queue[candidate]
+                }
             }
         }
 
-        for(const [key, item] of Object.entries(queue || {})) {
-            const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(key)
-            if(itemHref !== normalizedHref) continue
+        for(const candidate of candidates) {
+            for(const [key, item] of Object.entries(queue || {})) {
+                const itemHref = getCoordinatorItemHref(item) || storedProfileHref(key)
+                if(itemHref !== candidate) continue
 
-            return {
-                key,
-                item
+                return {
+                    key,
+                    item
+                }
             }
         }
 

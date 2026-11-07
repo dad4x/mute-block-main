@@ -1,0 +1,7 @@
+phase: probe
+phase: content worker
+phase: election
+phase: mirror
+mirror: steady
+mirror: late join
+mirror: handover

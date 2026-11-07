@@ -55,6 +55,12 @@
 // realm-crossing note) -- no realm-crossing risk. Both had exactly one
 // external reference each, called from deep inside resident async
 // enqueue-path functions, so no eager construction-order concern either.
+//
+// isArchivableCoordinatorRow (2026-10-13) is the narrower archive and run-rollup predicate: a terminal row is finished for good
+// unless it is a soft failure whose retryCount is still below the automatic retry limit (tunables.js). It reads the same
+// retryCount and the same soft-failure predicate as the retry feature, so the rows that stay live are exactly the rows that
+// can still be retried. It does not replace isTerminalCoordinatorStatus, which keeps its meaning for every other caller.
+const {SOFT_FAIL_RETRY_LIMIT} = require('./tunables')
 
 function createCoordinatorStatusRules(deps = {}) {
     const {
@@ -80,6 +86,17 @@ function createCoordinatorStatusRules(deps = {}) {
 
     function isRetryableCoordinatorFailure(item = null) {
         return isRetryableJobFailure(item)
+    }
+
+    // A terminal row that is finished for good. Hard failures, succeeded, skipped, canceled and every other terminal row are
+    // archivable as soon as they settle. A soft failure (isRetryableCoordinatorFailure) is archivable only once its retryCount
+    // has reached retryCap, the automatic retry limit. Below the cap it stays live as a requeue candidate, and a run that
+    // holds it is not finished (swCoordinatorRuns.js getCoordinatorRunStatus). A row that is not terminal is never archivable.
+    function isArchivableCoordinatorRow(row = null, retryCap = SOFT_FAIL_RETRY_LIMIT) {
+        if(!row || typeof row !== 'object') return false
+        if(!isTerminalCoordinatorStatus(row.status)) return false
+        if(!isRetryableCoordinatorFailure(row)) return true
+        return (Number.parseInt(row.retryCount, 10) || 0) >= retryCap
     }
 
     function isRetryableCoordinatorFailureFromProgress(item = null, record = null) {
@@ -122,6 +139,7 @@ function createCoordinatorStatusRules(deps = {}) {
         isPendingCoordinatorStatus,
         isRetryableCoordinatorFailure,
         isRetryableCoordinatorFailureFromProgress,
+        isArchivableCoordinatorRow,
         isCoordinatorQueueAuthoritativeItem,
         shouldResetCoordinatorItemForIncoming,
         shouldResetCoordinatorExecutor

@@ -1,0 +1,12 @@
+{
+  "interesting": [
+    {
+      "url": "https://www.quora.com/settings/muting",
+      "method": "GET",
+      "status": 200,
+      "mimeType": "text/html"
+    }
+  ],
+  "failed": [],
+  "totalRequests": 12
+}

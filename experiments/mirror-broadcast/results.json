@@ -1,0 +1,5367 @@
+{
+  "burst": {
+    "count": 300,
+    "intervalMs": 10
+  },
+  "steady": {
+    "progressViewer": {
+      "broadcast": {
+        "received": 300,
+        "lag": {
+          "meanMs": 0.3,
+          "p95Ms": 1,
+          "maxMs": 5
+        },
+        "epochs": {
+          "1": {
+            "received": 300,
+            "firstSeq": 1,
+            "lastSeq": 300,
+            "missingInRange": 0
+          }
+        }
+      },
+      "storage": {
+        "received": 300,
+        "lag": {
+          "meanMs": 0.5,
+          "p95Ms": 1,
+          "maxMs": 6
+        },
+        "epochs": {
+          "null": {
+            "received": 300,
+            "firstSeq": 1,
+            "lastSeq": 300,
+            "missingInRange": 0
+          }
+        }
+      }
+    },
+    "dashboardViewer": {
+      "broadcast": {
+        "received": 300,
+        "lag": {
+          "meanMs": 0.3,
+          "p95Ms": 1,
+          "maxMs": 5
+        },
+        "epochs": {
+          "1": {
+            "received": 300,
+            "firstSeq": 1,
+            "lastSeq": 300,
+            "missingInRange": 0
+          }
+        }
+      },
+      "storage": {
+        "received": 300,
+        "lag": {
+          "meanMs": 0.5,
+          "p95Ms": 1,
+          "maxMs": 6
+        },
+        "epochs": {
+          "null": {
+            "received": 300,
+            "firstSeq": 1,
+            "lastSeq": 300,
+            "missingInRange": 0
+          }
+        }
+      }
+    },
+    "serviceWorker": {
+      "bootId": "7c008e5f-0f38-4765-9cc3-6a8dfb158fde",
+      "received": {
+        "broadcast": [
+          {
+            "epoch": 1,
+            "seq": 1,
+            "lagMs": 2
+          },
+          {
+            "epoch": 1,
+            "seq": 2,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 3,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 4,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 5,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 6,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 7,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 8,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 9,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 10,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 11,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 12,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 13,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 14,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 15,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 16,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 17,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 18,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 19,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 20,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 21,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 22,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 23,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 24,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 25,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 26,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 27,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 28,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 29,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 30,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 31,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 32,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 33,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 34,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 35,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 36,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 37,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 38,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 39,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 40,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 41,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 42,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 43,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 44,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 45,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 46,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 47,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 48,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 49,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 50,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 51,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 52,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 53,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 54,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 55,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 56,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 57,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 58,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 59,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 60,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 61,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 62,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 63,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 64,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 65,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 66,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 67,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 68,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 69,
+            "lagMs": 5
+          },
+          {
+            "epoch": 1,
+            "seq": 70,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 71,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 72,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 73,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 74,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 75,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 76,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 77,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 78,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 79,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 80,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 81,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 82,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 83,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 84,
+            "lagMs": 3
+          },
+          {
+            "epoch": 1,
+            "seq": 85,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 86,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 87,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 88,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 89,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 90,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 91,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 92,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 93,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 94,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 95,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 96,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 97,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 98,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 99,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 100,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 101,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 102,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 103,
+            "lagMs": 3
+          },
+          {
+            "epoch": 1,
+            "seq": 104,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 105,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 106,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 107,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 108,
+            "lagMs": 2
+          },
+          {
+            "epoch": 1,
+            "seq": 109,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 110,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 111,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 112,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 113,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 114,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 115,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 116,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 117,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 118,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 119,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 120,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 121,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 122,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 123,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 124,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 125,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 126,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 127,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 128,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 129,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 130,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 131,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 132,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 133,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 134,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 135,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 136,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 137,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 138,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 139,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 140,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 141,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 142,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 143,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 144,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 145,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 146,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 147,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 148,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 149,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 150,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 151,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 152,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 153,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 154,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 155,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 156,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 157,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 158,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 159,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 160,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 161,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 162,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 163,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 164,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 165,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 166,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 167,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 168,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 169,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 170,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 171,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 172,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 173,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 174,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 175,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 176,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 177,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 178,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 179,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 180,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 181,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 182,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 183,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 184,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 185,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 186,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 187,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 188,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 189,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 190,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 191,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 192,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 193,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 194,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 195,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 196,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 197,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 198,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 199,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 200,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 201,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 202,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 203,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 204,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 205,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 206,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 207,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 208,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 209,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 210,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 211,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 212,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 213,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 214,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 215,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 216,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 217,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 218,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 219,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 220,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 221,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 222,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 223,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 224,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 225,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 226,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 227,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 228,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 229,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 230,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 231,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 232,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 233,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 234,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 235,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 236,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 237,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 238,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 239,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 240,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 241,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 242,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 243,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 244,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 245,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 246,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 247,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 248,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 249,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 250,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 251,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 252,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 253,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 254,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 255,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 256,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 257,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 258,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 259,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 260,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 261,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 262,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 263,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 264,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 265,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 266,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 267,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 268,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 269,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 270,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 271,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 272,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 273,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 274,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 275,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 276,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 277,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 278,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 279,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 280,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 281,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 282,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 283,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 284,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 285,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 286,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 287,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 288,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 289,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 290,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 291,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 292,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 293,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 294,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 295,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 296,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 297,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 298,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 299,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 300,
+            "lagMs": 0
+          }
+        ],
+        "storage": [
+          {
+            "epoch": null,
+            "seq": 1,
+            "lagMs": 2
+          },
+          {
+            "epoch": null,
+            "seq": 2,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 3,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 4,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 5,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 6,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 7,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 8,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 9,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 10,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 11,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 12,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 13,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 14,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 15,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 16,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 17,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 18,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 19,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 20,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 21,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 22,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 23,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 24,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 25,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 26,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 27,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 28,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 29,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 30,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 31,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 32,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 33,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 34,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 35,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 36,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 37,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 38,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 39,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 40,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 41,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 42,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 43,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 44,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 45,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 46,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 47,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 48,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 49,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 50,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 51,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 52,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 53,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 54,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 55,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 56,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 57,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 58,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 59,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 60,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 61,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 62,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 63,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 64,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 65,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 66,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 67,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 68,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 69,
+            "lagMs": 5
+          },
+          {
+            "epoch": null,
+            "seq": 70,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 71,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 72,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 73,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 74,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 75,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 76,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 77,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 78,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 79,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 80,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 81,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 82,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 83,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 84,
+            "lagMs": 3
+          },
+          {
+            "epoch": null,
+            "seq": 85,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 86,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 87,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 88,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 89,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 90,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 91,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 92,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 93,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 94,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 95,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 96,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 97,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 98,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 99,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 100,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 101,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 102,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 103,
+            "lagMs": 4
+          },
+          {
+            "epoch": null,
+            "seq": 104,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 105,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 106,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 107,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 108,
+            "lagMs": 2
+          },
+          {
+            "epoch": null,
+            "seq": 109,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 110,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 111,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 112,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 113,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 114,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 115,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 116,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 117,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 118,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 119,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 120,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 121,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 122,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 123,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 124,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 125,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 126,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 127,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 128,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 129,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 130,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 131,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 132,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 133,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 134,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 135,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 136,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 137,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 138,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 139,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 140,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 141,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 142,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 143,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 144,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 145,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 146,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 147,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 148,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 149,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 150,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 151,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 152,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 153,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 154,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 155,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 156,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 157,
+            "lagMs": 3
+          },
+          {
+            "epoch": null,
+            "seq": 158,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 159,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 160,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 161,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 162,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 163,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 164,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 165,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 166,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 167,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 168,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 169,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 170,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 171,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 172,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 173,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 174,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 175,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 176,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 177,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 178,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 179,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 180,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 181,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 182,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 183,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 184,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 185,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 186,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 187,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 188,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 189,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 190,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 191,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 192,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 193,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 194,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 195,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 196,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 197,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 198,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 199,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 200,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 201,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 202,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 203,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 204,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 205,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 206,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 207,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 208,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 209,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 210,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 211,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 212,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 213,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 214,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 215,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 216,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 217,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 218,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 219,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 220,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 221,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 222,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 223,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 224,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 225,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 226,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 227,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 228,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 229,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 230,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 231,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 232,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 233,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 234,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 235,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 236,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 237,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 238,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 239,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 240,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 241,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 242,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 243,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 244,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 245,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 246,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 247,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 248,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 249,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 250,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 251,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 252,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 253,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 254,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 255,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 256,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 257,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 258,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 259,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 260,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 261,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 262,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 263,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 264,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 265,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 266,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 267,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 268,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 269,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 270,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 271,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 272,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 273,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 274,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 275,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 276,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 277,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 278,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 279,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 280,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 281,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 282,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 283,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 284,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 285,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 286,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 287,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 288,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 289,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 290,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 291,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 292,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 293,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 294,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 295,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 296,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 297,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 298,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 299,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 300,
+            "lagMs": 1
+          }
+        ]
+      }
+    },
+    "contentScript": {
+      "broadcast": {
+        "received": 0,
+        "lag": null,
+        "epochs": {}
+      },
+      "storage": {
+        "received": 300,
+        "lag": {
+          "meanMs": 0.6,
+          "p95Ms": 1,
+          "maxMs": 6
+        },
+        "epochs": {
+          "null": {
+            "received": 300,
+            "firstSeq": 1,
+            "lastSeq": 300,
+            "missingInRange": 0
+          }
+        }
+      }
+    }
+  },
+  "lateJoin": {
+    "lateViewer": {
+      "broadcast": {
+        "received": 207,
+        "lag": {
+          "meanMs": 0.3,
+          "p95Ms": 1,
+          "maxMs": 3
+        },
+        "epochs": {
+          "1": {
+            "received": 207,
+            "firstSeq": 394,
+            "lastSeq": 600,
+            "missingInRange": 0
+          }
+        }
+      },
+      "storage": {
+        "received": 207,
+        "lag": {
+          "meanMs": 0.7,
+          "p95Ms": 1,
+          "maxMs": 3
+        },
+        "epochs": {
+          "null": {
+            "received": 207,
+            "firstSeq": 394,
+            "lastSeq": 600,
+            "missingInRange": 0
+          }
+        }
+      }
+    },
+    "mirrorSeqReadOnJoin": 600,
+    "note": "Messages sent before the viewer subscribed are not replayed; the mirror read gives the current seq."
+  },
+  "serviceWorkerRestart": {
+    "burstRange": {
+      "sentFrom": 601,
+      "sentTo": 900
+    },
+    "serviceWorkerAfterRestart": {
+      "bootId": "1abd9f7a-3cc8-4daa-b08a-a62176c078b8",
+      "received": {
+        "broadcast": [
+          {
+            "epoch": 1,
+            "seq": 693,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 694,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 695,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 696,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 697,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 698,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 699,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 700,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 701,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 702,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 703,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 704,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 705,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 706,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 707,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 708,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 709,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 710,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 711,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 712,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 713,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 714,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 715,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 716,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 717,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 718,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 719,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 720,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 721,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 722,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 723,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 724,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 725,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 726,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 727,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 728,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 729,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 730,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 731,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 732,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 733,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 734,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 735,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 736,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 737,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 738,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 739,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 740,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 741,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 742,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 743,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 744,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 745,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 746,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 747,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 748,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 749,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 750,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 751,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 752,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 753,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 754,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 755,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 756,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 757,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 758,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 759,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 760,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 761,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 762,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 763,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 764,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 765,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 766,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 767,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 768,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 769,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 770,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 771,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 772,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 773,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 774,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 775,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 776,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 777,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 778,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 779,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 780,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 781,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 782,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 783,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 784,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 785,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 786,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 787,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 788,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 789,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 790,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 791,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 792,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 793,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 794,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 795,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 796,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 797,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 798,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 799,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 800,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 801,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 802,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 803,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 804,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 805,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 806,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 807,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 808,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 809,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 810,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 811,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 812,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 813,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 814,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 815,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 816,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 817,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 818,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 819,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 820,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 821,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 822,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 823,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 824,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 825,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 826,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 827,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 828,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 829,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 830,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 831,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 832,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 833,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 834,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 835,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 836,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 837,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 838,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 839,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 840,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 841,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 842,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 843,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 844,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 845,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 846,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 847,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 848,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 849,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 850,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 851,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 852,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 853,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 854,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 855,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 856,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 857,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 858,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 859,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 860,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 861,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 862,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 863,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 864,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 865,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 866,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 867,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 868,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 869,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 870,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 871,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 872,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 873,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 874,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 875,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 876,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 877,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 878,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 879,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 880,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 881,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 882,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 883,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 884,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 885,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 886,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 887,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 888,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 889,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 890,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 891,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 892,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 893,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 894,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 895,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 896,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 897,
+            "lagMs": 1
+          },
+          {
+            "epoch": 1,
+            "seq": 898,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 899,
+            "lagMs": 0
+          },
+          {
+            "epoch": 1,
+            "seq": 900,
+            "lagMs": 0
+          }
+        ],
+        "storage": [
+          {
+            "epoch": null,
+            "seq": 692,
+            "lagMs": 4
+          },
+          {
+            "epoch": null,
+            "seq": 693,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 694,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 695,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 696,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 697,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 698,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 699,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 700,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 701,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 702,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 703,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 704,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 705,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 706,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 707,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 708,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 709,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 710,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 711,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 712,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 713,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 714,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 715,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 716,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 717,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 718,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 719,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 720,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 721,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 722,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 723,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 724,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 725,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 726,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 727,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 728,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 729,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 730,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 731,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 732,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 733,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 734,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 735,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 736,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 737,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 738,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 739,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 740,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 741,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 742,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 743,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 744,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 745,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 746,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 747,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 748,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 749,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 750,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 751,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 752,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 753,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 754,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 755,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 756,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 757,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 758,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 759,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 760,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 761,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 762,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 763,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 764,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 765,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 766,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 767,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 768,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 769,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 770,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 771,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 772,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 773,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 774,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 775,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 776,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 777,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 778,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 779,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 780,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 781,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 782,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 783,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 784,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 785,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 786,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 787,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 788,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 789,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 790,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 791,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 792,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 793,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 794,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 795,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 796,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 797,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 798,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 799,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 800,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 801,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 802,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 803,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 804,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 805,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 806,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 807,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 808,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 809,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 810,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 811,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 812,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 813,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 814,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 815,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 816,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 817,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 818,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 819,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 820,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 821,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 822,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 823,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 824,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 825,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 826,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 827,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 828,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 829,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 830,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 831,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 832,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 833,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 834,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 835,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 836,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 837,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 838,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 839,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 840,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 841,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 842,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 843,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 844,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 845,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 846,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 847,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 848,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 849,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 850,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 851,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 852,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 853,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 854,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 855,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 856,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 857,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 858,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 859,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 860,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 861,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 862,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 863,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 864,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 865,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 866,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 867,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 868,
+            "lagMs": 2
+          },
+          {
+            "epoch": null,
+            "seq": 869,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 870,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 871,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 872,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 873,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 874,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 875,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 876,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 877,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 878,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 879,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 880,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 881,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 882,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 883,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 884,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 885,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 886,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 887,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 888,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 889,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 890,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 891,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 892,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 893,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 894,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 895,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 896,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 897,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 898,
+            "lagMs": 0
+          },
+          {
+            "epoch": null,
+            "seq": 899,
+            "lagMs": 1
+          },
+          {
+            "epoch": null,
+            "seq": 900,
+            "lagMs": 1
+          }
+        ]
+      }
+    },
+    "progressViewerAfterRestart": {
+      "broadcast": {
+        "received": 900,
+        "lag": {
+          "meanMs": 0.2,
+          "p95Ms": 1,
+          "maxMs": 6
+        },
+        "epochs": {
+          "1": {
+            "received": 900,
+            "firstSeq": 1,
+            "lastSeq": 900,
+            "missingInRange": 0
+          }
+        }
+      },
+      "storage": {
+        "received": 900,
+        "lag": {
+          "meanMs": 0.5,
+          "p95Ms": 1,
+          "maxMs": 6
+        },
+        "epochs": {
+          "null": {
+            "received": 900,
+            "firstSeq": 1,
+            "lastSeq": 900,
+            "missingInRange": 0
+          }
+        }
+      }
+    }
+  },
+  "ownerHandover": {
+    "newEpoch": 2,
+    "ownerTwoRange": {
+      "sentFrom": 1,
+      "sentTo": 100
+    },
+    "progressViewer": {
+      "broadcast": {
+        "received": 1001,
+        "lag": {
+          "meanMs": 0.2,
+          "p95Ms": 1,
+          "maxMs": 6
+        },
+        "epochs": {
+          "1": {
+            "received": 901,
+            "firstSeq": 1,
+            "lastSeq": 901,
+            "missingInRange": 0
+          },
+          "2": {
+            "received": 100,
+            "firstSeq": 1,
+            "lastSeq": 100,
+            "missingInRange": 0
+          }
+        }
+      },
+      "storage": {
+        "received": 1001,
+        "lag": {
+          "meanMs": 0.5,
+          "p95Ms": 1,
+          "maxMs": 6
+        },
+        "epochs": {
+          "null": {
+            "received": 901,
+            "firstSeq": 1,
+            "lastSeq": 901,
+            "missingInRange": 0
+          }
+        }
+      }
+    },
+    "dashboardViewer": {
+      "broadcast": {
+        "received": 1001,
+        "lag": {
+          "meanMs": 0.3,
+          "p95Ms": 1,
+          "maxMs": 6
+        },
+        "epochs": {
+          "1": {
+            "received": 901,
+            "firstSeq": 1,
+            "lastSeq": 901,
+            "missingInRange": 0
+          },
+          "2": {
+            "received": 100,
+            "firstSeq": 1,
+            "lastSeq": 100,
+            "missingInRange": 0
+          }
+        }
+      },
+      "storage": {
+        "received": 1001,
+        "lag": {
+          "meanMs": 0.5,
+          "p95Ms": 1,
+          "maxMs": 6
+        },
+        "epochs": {
+          "null": {
+            "received": 901,
+            "firstSeq": 1,
+            "lastSeq": 901,
+            "missingInRange": 0
+          }
+        }
+      }
+    }
+  }
+}

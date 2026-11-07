@@ -1,0 +1,37 @@
+{
+  "command": "routing",
+  "result": {
+    "ownerPresent": {
+      "ok": true,
+      "attempts": 1,
+      "totalMs": 2,
+      "errors": []
+    },
+    "ownerAbsentThenStart": {
+      "ok": true,
+      "attempts": 3,
+      "totalMs": 3262,
+      "errors": [
+        "sw",
+        "sw"
+      ]
+    },
+    "ownerRestartInFlight": {
+      "ok": true,
+      "attempts": 2,
+      "totalMs": 3839,
+      "errors": [
+        "timeout"
+      ]
+    },
+    "serviceWorkerTerminatedWhileAbsent": {
+      "ok": true,
+      "attempts": 3,
+      "totalMs": 2326,
+      "errors": [
+        "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+        "sw"
+      ]
+    }
+  }
+}

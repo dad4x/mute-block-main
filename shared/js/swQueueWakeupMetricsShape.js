@@ -23,6 +23,7 @@
 // (two separate factories would need one to inject a not-yet-constructed
 // function into the other).
 
+const {STORED_ERROR_TEXT_MAX_CHARS} = require('./tunables')
 const MAX_QUEUE_WAKEUP_METRIC_PAUSE_WINDOWS = 50
 const MAX_QUEUE_WAKEUP_METRIC_THROTTLE_WINDOWS = 50
 // 2026-09-28: the shared `journal` array is dominated by high-frequency
@@ -898,7 +899,7 @@ function createQueueWakeupMetricsShape(deps = {}) {
                 result[key] = value
             }
             else if(typeof value === 'string') {
-                result[key] = value.slice(0, 240)
+                result[key] = value.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
         return result

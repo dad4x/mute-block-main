@@ -66,6 +66,7 @@ function createQueuedTabReclaimResume(deps = {}) {
         isProfileResolutionItem,
         normalizeQuoraProfileUrl,
         getOwnedOrExpectedLiveTabsForProfileHref,
+        isOwnedWorkerSurfaceTab,
         getPersistedQueuedTabId,
         normalizeTabId,
         incrementQueueWakeupMetric,
@@ -120,9 +121,15 @@ function createQueuedTabReclaimResume(deps = {}) {
         return candidates.find(tab => tab?.active !== true) || candidates[0] || null
     }
 
+    // A tab counts as the queue's only if the queue opened it (its metadata, its active row, or its owned state). Nothing else is adopted
+    // or closed here (owner, 7 Nov).
+    function isQueueOwnedTab(tab = null) {
+        return isOwnedWorkerSurfaceTab(tab)
+    }
+
     function selectQueuedWorkerReclaimTab(candidates = [], reason = 'queued-worker-reclaim') {
         const ordered = (candidates || [])
-            .filter(tab => normalizeTabId(tab?.id))
+            .filter(tab => normalizeTabId(tab?.id) && isQueueOwnedTab(tab))
             .sort((left, right) => {
                 if(left?.active === true && right?.active !== true) return 1
                 if(left?.active !== true && right?.active === true) return -1
@@ -140,7 +147,7 @@ function createQueuedTabReclaimResume(deps = {}) {
 
         recordCoordinatorDiagnosticEvent(
             'duplicate-worker-surface-tabs-reclaimed',
-            `${reason || 'queued-worker-reclaim'} selected one worker tab and closed ${ordered.length - 1} duplicate tab(s)`
+            `${reason || 'queued-worker-reclaim'} selected one worker tab and closed ${ordered.length - 1} duplicate queue tab(s)`
         )
         return selected
     }

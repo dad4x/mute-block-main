@@ -1,6 +1,6 @@
 /* mute block button */
 .mb-ext_mute-block-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     color: #fff;
     border: none;
     border-radius: 999px;
@@ -11,7 +11,7 @@
     margin-left: 5px;
 }
 .mb-ext_mute-block-btn:hover {
-    background-color: rgb(168, 39, 35);
+    background-color: var(--mb-brand-red-dark);
 }
 
 .mb-ext_mute-block-close-btn {
@@ -46,7 +46,7 @@
 
 /* find original poster button */
 .mb-ext_find-op-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     color: #fff;
     border: none;
     border-radius: 999px;
@@ -63,7 +63,7 @@
 }
 
 .mb-ext_find-op-btn:hover {
-    background-color: rgb(168, 39, 35);
+    background-color: var(--mb-brand-red-dark);
 }
 
 .mb-ext_question-center-slot {
@@ -75,7 +75,7 @@
 
 /* find original poster log page button */
 .mb-ext_find-op-log-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     color: #fff;
     border: none;
     border-radius: 999px;
@@ -86,7 +86,7 @@
 }
 
 .mb-ext_find-op-log-btn:hover {
-    background-color: rgb(168, 39, 35);
+    background-color: var(--mb-brand-red-dark);
 }
 
 /* close tab button */
@@ -109,7 +109,7 @@
 
 /* open profiles button */
 .mb-ext_open-profiles-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     color: #fff;
     border: none;
     border-radius: 999px;
@@ -121,7 +121,7 @@
     gap: 4px;
 }
 .mb-ext_open-profiles-btn:hover {
-    background-color: rgb(168, 39, 35);
+    background-color: var(--mb-brand-red-dark);
 }
 
 .mb-ext_view-contributors-btn {
@@ -150,12 +150,52 @@
     opacity: 1;
 }
 
+/* While a collect runs, Nuke 'Em on the space page and in the contributors popup is held and greyed (7 Nov). The gate sets the attribute
+   (applyCollectNukeGate), so the grey look is the same one a disabled Nuke 'Em 0 has. */
+.mb-ext_nuke-profiles-btn[data-mb-collect-gated="true"]:disabled {
+    background-color: #f3f4f6;
+    color: #7b8494;
+    border-color: rgba(123, 132, 148, 0.24);
+    box-shadow: none;
+}
+
+/* A Nuke 'Em that a running collect holds (4 Nov): disabled and dimmed, so it reads as unavailable, not broken. */
+.mb-ext_nuke-profiles-btn[data-mb-collect-gated="true"] {
+    cursor: not-allowed;
+    opacity: 0.45;
+}
+
+/* 1 Nov (audit): a status display (Nuking, Nuked, a notice or error) is not a button, so it is a rectangle, disabled or not. A real button
+   stays a pill. The state setters in content.js add this class. */
+.mb-ext_nuke-profiles-btn--status {
+    border-radius: 4px;
+    cursor: default;
+}
 .mb-ext_nuke-profiles-btn:hover {
     background-color: #000;
 }
 
 .mb-ext_nuke-profiles-btn--flash {
     animation: mb-ext-nuke-double-flash 350ms ease-out;
+}
+
+/* Every extension button on a Quora page flashes once when pressed (6 Nov). Nuke 'Em keeps its own double flash. */
+.mb-button-press-flash {
+    animation: mb-button-press-flash var(--mb-button-press-flash-ms) ease-out;
+}
+
+@keyframes mb-button-press-flash {
+    0% {
+        filter: invert(0);
+    }
+
+    30% {
+        filter: invert(1);
+    }
+
+    100% {
+        filter: invert(0);
+    }
 }
 
 @keyframes mb-ext-nuke-double-flash {
@@ -219,6 +259,19 @@
     box-shadow: inset 0 0 0 1px #000;
 }
 
+/* 1 Nov (owner): a running collect is an active button, so its Stop collecting label is a black pill. */
+[class*="collect"].mb-ext_nuke-profiles-btn--working,
+[class*="collect"].mb-ext_nuke-profiles-btn--working:hover {
+    background-color: #111;
+    color: #fff;
+    box-shadow: none;
+}
+
+/* 1 Nov (owner): the running collect's Stop is an action, so it is a pill even though it reads as a status while it runs. */
+[class*="collect"].mb-ext_nuke-profiles-btn--working.mb-ext_nuke-profiles-btn--status {
+    border-radius: 999px;
+}
+
 .mb-ext_nuke-profiles-btn--done {
     background-color: #6b7280;
     color: #fff;
@@ -237,7 +290,9 @@
     right: 18px;
     z-index: 2147483646;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
+    justify-content: flex-end;
     gap: 8px;
     pointer-events: auto;
 }
@@ -259,12 +314,153 @@
     border-color: #000;
 }
 
+/* Any Nuke 'Em that is disabled and not carrying a status (working, done, bad links) reads grey, the look of Nuke 'Em 0 (7 Nov). */
+.mb-ext_nuke-profiles-btn:disabled:not(.mb-ext_nuke-profiles-btn--working):not(.mb-ext_nuke-profiles-btn--done):not(.mb-ext_nuke-profiles-btn--bad-links):not(.mb-ext_nuke-profiles-btn--status),
 .mb-ext_profile-search-toolbar .mb-ext_nuke-profiles-btn:disabled,
 .mb-ext_profile-search-action-host .mb-ext_nuke-profiles-btn:disabled {
     background-color: #f3f4f6;
     color: #7b8494;
     border-color: rgba(123, 132, 148, 0.24);
     box-shadow: none;
+}
+
+.mb-ext_profile-search-collect-wrap {
+    position: relative;
+    display: inline-flex;
+}
+
+/* The popup's header (1 Nov): the right group (Open Profiles, Nuke 'Em, the collect copy) sits at the right edge with a constant gap. The copy
+   sizes to its content, so a longer running label moves the buttons to its left instead of overflowing the popup. */
+.mb-ext_modal-collect-wrap {
+    margin-left: 8px;
+}
+
+/* The Collect result under the button, the same on the space page and the popup (5 Nov). It is a caption below the button, not a row in the toolbar (6 Nov). */
+.mb-ext_space-collect-wrap,
+.mb-ext_modal-collect-wrap {
+    align-items: center;
+    column-gap: 8px;
+    flex-wrap: wrap;
+    position: relative;
+}
+
+.mb-ext_collect-result {
+    color: #444;
+    /* Out of the flow: the caption sits under the button, so the toolbar buttons keep one vertical centre (6 Nov). */
+    margin-top: 2px;
+    position: absolute;
+    right: 0;
+    top: 100%;
+    font-size: 11px;
+    line-height: 1.2;
+    text-align: right;
+    white-space: nowrap;
+}
+
+[role="dialog"] .mb-ext_open-profiles-btn {
+    margin-left: auto;
+}
+
+.mb-ext_modal-collect-btn {
+    max-width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+/* The caret is part of the Collect N More button. The count dropdown is a transparent select over it, so the caret opens the list. */
+.mb-ext_profile-search-collect-btn::after {
+    content: '';
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid currentColor;
+}
+
+.mb-ext_profile-search-collect-limit {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 24px;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    opacity: 0;
+    cursor: pointer;
+}
+
+/* While a collect runs the dropdown is disabled and lets clicks through, so the button still stops it. */
+.mb-ext_profile-search-collect-limit:disabled {
+    pointer-events: none;
+}
+
+.mb-ext_profile-search-collect-wrap:focus-within .mb-ext_profile-search-collect-btn {
+    outline: 2px solid #111;
+    outline-offset: 2px;
+}
+
+/* Space pages: the Collect N More button on its own row, above the MB Info and Nuke 'Em buttons of the feed toolbar. */
+/* 1 Nov (owner): the Posts-page copy shares the toolbar row with MB Info and Nuke 'Em, after them, so MB Info leads the row. */
+.mb-ext_space-feed-toolbar > .mb-ext_space-collect-feed-host {
+    order: 1;
+    display: flex;
+    justify-content: flex-end;
+}
+
+/* The copy sits after the last box, so it shows only once the boxes have scrolled past. Not sticky: a sticky copy floats over the boxes (owner, 25 Oct). */
+.mb-ext_space-collect-column-host {
+    margin-top: 8px;
+}
+
+/* Stop collecting, on space and search pages alike (owner, 26 Oct): fixed above the Next notification pill row, with its LEFT edge on the
+   "Collect N More" button's left edge (owner correction, option 3). Measured offsets, not tokens.
+   Search page (measured 1079px window, 1064px layout width): the Collect N More button's left edge is 906.5px. That button sits in the fixed toolbar,
+   which is anchored 18px from the right edge and is 139.5px wide here (text "Collect 100 More"). The Stop button's natural width is 113.5px
+   (text 91.5px + 20px padding + 2px border; measured by canvas from the shared button font).
+   right: 44px = 18px toolbar gap + 139.5px Collect button - 113.5px Stop width. A wider count (for example 1000) widens the Collect button and this offset then drifts.
+   Space page: not measured (no space page was open to probe), so this is the search-page offset, unverified for spaces.
+   bottom: 84px (owner decision, option 3: keep the full label and sit above the Next notification pill). From the owner's screenshot the pill's top edge
+   is about 66-68px above the viewport bottom (pill y 798 to 836 with the 28px Progress bar below it, in an ~866px-tall window), so 84px leaves a 16px gap above it.
+   The pill is not in the DOM, so this is a measured offset, not a token. Same z-index as the search toolbar. */
+/* The popup's Stop collecting button sits where the space's does (7 Nov). */
+.mb-ext_modal-stop-btn {
+    position: fixed;
+    right: 44px;
+    bottom: 84px;
+    z-index: 2147483646;
+    margin: 0;
+    background-color: var(--mb-grey-900);
+    color: var(--mb-white);
+    border: 1px solid var(--mb-grey-900);
+    box-shadow: 0 1px 2px rgba(var(--mb-black-rgb), 0.12);
+    white-space: nowrap;
+}
+
+.mb-ext_space-collect-stop-btn,
+.mb-ext_profile-search-stop-btn {
+    position: fixed;
+    right: 44px;
+    bottom: 84px;
+    z-index: 2147483646;
+    margin: 0;
+    background-color: var(--mb-grey-900);
+    color: var(--mb-white);
+    border: 1px solid var(--mb-grey-900);
+    box-shadow: 0 1px 2px rgba(var(--mb-black-rgb), 0.12);
+    white-space: nowrap;
+}
+
+.mb-ext_space-collect-stop-btn:not(:disabled):hover,
+.mb-ext_profile-search-stop-btn:not(:disabled):hover {
+    background-color: var(--mb-black);
+    color: var(--mb-white);
+    border-color: var(--mb-black);
+}
+
+.mb-ext_space-collect-stop-btn[hidden],
+.mb-ext_profile-search-stop-btn[hidden] {
+    display: none;
 }
 
 .mb-ext_profile-search-toolbar .mb-ext_nuke-profiles-btn--working,
@@ -298,6 +494,12 @@
     margin-left: 0;
     font-size: 12px;
     padding: 3px 8px;
+}
+
+/* A search row that is nuking shows only its drop-down (3 Nov): the working chip beside it is hidden. The rule needs the drop-down
+   right after the chip, so a queueing row, which has no drop-down, keeps its chip. */
+.mb-ext_profile-search-action-host .mb-ext_profile-search-row-btn.mb-ext_nuke-profiles-btn--working:has(+ .mb-ext_nuking-control) {
+    display: none;
 }
 
 .mb-ext_post-nuke-btn {
@@ -339,6 +541,102 @@
     padding: 8px 18px 8px;
     border-top: 1px solid rgba(17, 24, 39, 0.08);
     background: rgba(255, 255, 255, 0.96);
+}
+
+/* The queue's status beside the Nuke 'Em button and the batch button (owner, 25 Oct): a display only, so it does not hold either button. */
+/* One rule for both batch toolbars (28 Oct): the space page and the search page use the same class (NUKING_TOOLBAR_STATUS_CLASS in content.js). */
+/* The toolbar status is a status box, not a pill (5 Nov): pause is in the progress bar, so there is no drop-down beside it. */
+/* The status span is a placeholder for the nuking control when it has no words to show: it must not draw an empty pill (7 Nov). */
+.mb-ext_nuking-status:empty {
+    display: none;
+}
+
+.mb-ext_nuking-status {
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    color: #374151;
+    font-size: 12px;
+    padding: 2px 8px;
+    white-space: nowrap;
+    align-self: center;
+}
+
+/* The Nuking drop-down (owner, 28 Oct): a caret toggle beside a Nuking button or the toolbar status, with Pause and Resume in a small menu. */
+.mb-ext_nuking-control {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+
+/* 1 Nov (audit): a drop-down is an action, so it is a pill. It matches the Nuke 'Em buttons' size (14px text, 4px 10px padding, no
+   border), so the border is an inset shadow and does not add height. */
+.mb-ext_nuking-control-toggle {
+    display: flex;
+    align-items: center;
+    font-size: 14px;
+    line-height: 1.15;
+    padding: 4px 10px;
+    border: 0;
+    box-shadow: inset 0 0 0 1px var(--mb-grey-300);
+    border-radius: 999px;
+    background: var(--mb-white);
+    color: var(--mb-grey-700);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.mb-ext_nuking-control-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 10000;
+    display: flex;
+    flex-direction: column;
+    min-width: 120px;
+    padding: 4px;
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.mb-ext_nuking-control-menu[hidden] {
+    display: none;
+}
+
+.mb-ext_nuking-control-item {
+    text-align: left;
+    font-size: 12px;
+    padding: 4px 8px;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    color: var(--mb-grey-800);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.mb-ext_nuking-control-item:hover:not(:disabled) {
+    background: var(--mb-grey-100);
+}
+
+.mb-ext_nuking-control-item:disabled {
+    color: var(--mb-grey-500);
+    cursor: default;
+}
+
+/* The Considered line and its cause under the Collect N More button (owner, 27 Oct). Each takes its own row of the toolbar, right-aligned under the button. */
+.mb-ext_profile-search-considered,
+.mb-ext_profile-search-considered-cause {
+    flex-basis: 100%;
+    text-align: right;
+    font-size: 12px;
+    color: var(--mb-grey-600);
+    white-space: nowrap;
 }
 
 .mb-ext_space-feed-status-host {
@@ -407,7 +705,7 @@
 }
 
 .mb-ext_space-category-btn--active[data-category="asset"] {
-    background: #176a43;
+    background: var(--mb-category-asset);
     box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.18), 0 6px 18px rgba(0, 0, 0, 0.24);
     color: #fff;
 }
@@ -419,7 +717,7 @@
 }
 
 .mb-ext_space-category-btn--active[data-category="target"] {
-    background: #b92b27;
+    background: var(--mb-category-target);
     box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.18), 0 6px 18px rgba(0, 0, 0, 0.24);
     color: #fff;
 }
@@ -448,12 +746,12 @@
 }
 
 .mb-ext_space-feed-post-single-nuke-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     margin-left: 0;
 }
 
 .mb-ext_space-feed-post-single-nuke-btn:hover {
-    background-color: #a82723;
+    background-color: var(--mb-brand-red-dark);
 }
 
 .mb-ext_space-feed-post-single-nuke-btn.mb-ext_space-feed-post-single-nuke-btn--neutral,
@@ -475,21 +773,72 @@
     background-color: #6b7280;
 }
 
+/* Owner, 23 Oct: a post whose profiles ended in errors and none can be queued shows a white "Bad Links" button. */
+.mb-ext_space-feed-post-single-nuke-btn.mb-ext_nuke-profiles-btn--bad-links,
+.mb-ext_space-feed-post-single-nuke-btn.mb-ext_nuke-profiles-btn--bad-links:hover {
+    background-color: #ffffff;
+    color: #111827;
+    box-shadow: inset 0 0 0 1px #9ca3af;
+}
+
+/* 1 Nov (owner): two or more reasons on one post stack, one line per reason, in a taller pill. */
+.mb-ext_space-feed-post-single-nuke-btn.mb-ext_nuke-profiles-btn--bad-links.mb-ext_nuke-profiles-btn--stacked {
+    display: block;
+    text-align: center;
+    line-height: 1.25;
+    padding: 6px 12px;
+    white-space: normal;
+}
+
+/* Owner, 29 Oct: the list beside a Bad Links button, one line per failed profile. It sits under the button, inside the post's controls. */
+.mb-ext_space-feed-bad-links {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 260px;
+    max-width: 360px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background-color: var(--mb-white);
+    color: var(--mb-grey-900);
+    box-shadow: inset 0 0 0 1px var(--mb-grey-300);
+    font-size: 13px;
+    line-height: 1.4;
+    text-align: left;
+}
+
+.mb-ext_space-feed-bad-links[hidden] {
+    display: none;
+}
+
+.mb-ext_space-feed-bad-links-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 8px;
+}
+
+.mb-ext_space-feed-bad-links-link {
+    color: var(--mb-blue-600);
+    font-weight: 600;
+    text-decoration: underline;
+    word-break: break-all;
+}
+
+.mb-ext_space-feed-bad-links-reason {
+    color: var(--mb-grey-600);
+}
+
 .mb-ext_space-feed-post-queue-btn {
     margin-left: 0;
     background-color: #111827;
 }
 
 .mb-ext_space-feed-post-queue-btn:hover {
-    background-color: #374151;
-}
-
-.mb-ext_space-feed-pause-btn {
-    background-color: #111827;
-    margin-left: 8px;
-}
-
-.mb-ext_space-feed-pause-btn:hover {
     background-color: #374151;
 }
 
@@ -501,4 +850,46 @@
     display: flex !important;
     align-items: center;
     gap: 8px;
+}
+
+/* The starting spinner, shown while the queue worker does not answer (7 Nov). */
+.mb-ext_worker-starting {
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    z-index: 2147483646;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 999px;
+    color: #111;
+    font: 12px/1.2 system-ui, -apple-system, sans-serif;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.mb-ext_worker-starting-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid #d1d5db;
+    border-top-color: #111;
+    border-radius: 50%;
+    animation: mb-ext-worker-spin 0.8s linear infinite;
+}
+
+@keyframes mb-ext-worker-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* The contributors popup's header wraps, and its Collect button keeps one width for its labels, so a change of label does not move the row (7 Nov). */
+.mb-ext_modal-header {
+    flex-wrap: wrap;
+    row-gap: 6px;
+}
+
+.mb-ext_modal-collect-btn {
+    min-width: 160px;
+    white-space: nowrap;
 }

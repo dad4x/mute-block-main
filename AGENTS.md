@@ -1,5 +1,7 @@
 # Build Rule
 
+> **Workspace map:** this tree is ACTIVE, the 1.6 release candidate on rc/1.6. New work goes here. For which trees are active and the rules shared by all Mute Block checkouts, read [AGENTS.md](../../AGENTS.md) and [MUTE_BLOCK_README.md](../../MUTE_BLOCK_README.md).
+
 This repository is a normal Git project, not an ADE workspace. ADE checkout,
 transaction, view, and `$ADE_VIEW_ROOT` restrictions do not apply here. Do not
 run ADE commands, require ADE checkout, or apply ADE permission rules in this

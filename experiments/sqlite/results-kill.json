@@ -1,0 +1,345 @@
+{
+  "rowCount": 2000,
+  "outcomes": [
+    {
+      "trial": 1,
+      "killAtRows": 400,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 85,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 2,
+      "killAtRows": 100,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 90,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 3,
+      "killAtRows": 300,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 86,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 4,
+      "killAtRows": 200,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 82,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 5,
+      "killAtRows": 400,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 88,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 6,
+      "killAtRows": 1000,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 86,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 7,
+      "killAtRows": 1200,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 84,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 8,
+      "killAtRows": 1200,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 83,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 9,
+      "killAtRows": 1700,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 90,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 10,
+      "killAtRows": 1200,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 88,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 11,
+      "killAtRows": 1700,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 152,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 12,
+      "killAtRows": 600,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 124,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 13,
+      "killAtRows": 1700,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 112,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 14,
+      "killAtRows": 1200,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 97,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 15,
+      "killAtRows": 400,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 93,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 16,
+      "killAtRows": 1500,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 87,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 17,
+      "killAtRows": 800,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 82,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 18,
+      "killAtRows": 1400,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 83,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 19,
+      "killAtRows": 1700,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 104,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    },
+    {
+      "trial": 20,
+      "killAtRows": 1000,
+      "terminatedMidWrite": true,
+      "writeError": "worker terminated",
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 111,
+      "reopenError": null,
+      "markerSeq": 1,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        1
+      ],
+      "consistent": true,
+      "committedThisSeq": false
+    }
+  ]
+}

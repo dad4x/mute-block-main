@@ -1,0 +1,9 @@
+[
+  {
+    "url": "https://www.quora.com/settings/muting",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "mimeType": "text/html"
+  }
+]

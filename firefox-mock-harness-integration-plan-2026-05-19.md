@@ -1,5 +1,7 @@
 # Firefox Mock Harness Integration Plan, 2026-05-19
 
+> **Status: ROADMAP** (24 Oct 2026). Mock Quora and Firefox harness plan (19 May). The harness exists under tools/; the plan's remaining items are not verified. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: active supporting harness plan.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

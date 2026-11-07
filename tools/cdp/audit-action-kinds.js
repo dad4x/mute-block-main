@@ -1,9 +1,18 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_RUNS_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
+// The stored names of the queue and the run list: the layout prefix plus the plain key name (storageNamespace.js).
+const STORED_NAMES = {
+    queue: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`,
+    runs: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_RUNS_KEY}`
+}
+
 const {
     evaluate,
     getCdpConfig,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 
@@ -20,15 +29,14 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function auditActionKinds() {
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function auditActionKinds(progress, names) {
         const storage = await chrome.storage.local.get({
-            mbCoordinatorQueue: {},
-            mbProfileNukeProgressView: {},
-            mbCoordinatorRuns: {}
+            [names.queue]: {},
+            [names.runs]: {}
         })
-        const queue = storage.mbCoordinatorQueue || {}
-        const progress = storage.mbProfileNukeProgressView?.records || {}
-        const runs = storage.mbCoordinatorRuns || {}
+        const queue = storage[names.queue] || {}
+        const runs = storage[names.runs] || {}
         const countBy = (values, selector) => values.reduce((counts, value) => {
             const key = selector(value) || '(empty)'
             counts[key] = (counts[key] || 0) + 1
@@ -90,7 +98,7 @@ runMain(async () => {
             unblockConfirmEventCount: unblockConfirmEvents.length,
             unblockConfirmEvents: unblockConfirmEvents.slice(-25)
         }
-    }})()`, 20000)
+    }})(${JSON.stringify(progressRecords)}, ${JSON.stringify(STORED_NAMES)})`, 20000)
 
     console.log(JSON.stringify(result, null, 2))
 })

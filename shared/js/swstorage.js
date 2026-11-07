@@ -187,7 +187,32 @@ function createSerializedStorageUpdateQueue(options = {}) {
         onQueueWait: typeof options.onQueueWait === 'function' ? options.onQueueWait : () => {},
         onTimeoutRecovery: typeof options.onTimeoutRecovery === 'function' ? options.onTimeoutRecovery : () => {},
         pushJournalEntry: typeof options.pushJournalEntry === 'function' ? options.pushJournalEntry : () => {},
-        startCycle: typeof options.startCycle === 'function' ? options.startCycle : () => ({})
+        startCycle: typeof options.startCycle === 'function' ? options.startCycle : () => ({}),
+        // Diagnostic only (2026-10-17). recordEvent receives one flight-recorder entry per update, and one more on a timeout that
+        // names the lane's holder. getQueueSnapshot reads the lane's own state. onTimeoutStallCheck runs the stall check from the
+        // timeout path, because reconcile waits behind this same lane during a stall and cannot run it then.
+        getQueueSnapshot: typeof options.getQueueSnapshot === 'function' ? options.getQueueSnapshot : () => ({}),
+        onTimeoutStallCheck: typeof options.onTimeoutStallCheck === 'function' ? options.onTimeoutStallCheck : () => {},
+        recordEvent: typeof options.recordEvent === 'function' ? options.recordEvent : () => {}
+    }
+
+    // One settled-update entry: the reason label, the enqueue, start and finish times, and the timeout. Built from the context the
+    // lane already keeps, so every outcome records the same fields.
+    function makeStorageUpdateSettledEvent(context = {}, outcome = '') {
+        return {
+            kind: 'storage-update',
+            source: 'swstorage.enqueue',
+            outcome,
+            reason: context.reason || '',
+            updateToken: context.updateToken,
+            enqueuedAt: context.enqueuedAt || 0,
+            startedAt: context.startedAt || 0,
+            finishedAt: context.finishedAt || 0,
+            timeoutMs: context.timeoutMs || 0,
+            queueWaitMs: context.queueWaitMs || 0,
+            runMs: context.startedAt && context.finishedAt ? context.finishedAt - context.startedAt : 0,
+            depth: context.depth || 0
+        }
     }
 
     function enqueue(update, queueOptions = {}) {
@@ -250,6 +275,29 @@ function createSerializedStorageUpdateQueue(options = {}) {
                     }
                     hooks.incrementMetric(storageContext.timeoutPhase)
                     hooks.incrementMetric(`storageUpdate.${storageContext.timeoutPhase}`)
+                    // Recorded before the recovery below, so the holder is the one that held the lane at the timeout.
+                    const timeoutSnapshot = hooks.getQueueSnapshot() || {}
+                    hooks.recordEvent({
+                        kind: 'storage-update-timeout',
+                        source: 'swstorage.enqueue',
+                        reason: queueOptions.reason || '',
+                        updateToken,
+                        enqueuedAt,
+                        startedAt: storageContext.startedAt || 0,
+                        timedOutAt: storageContext.timedOutAt,
+                        timeoutMs,
+                        currentPhase: storageContext.currentPhase,
+                        timeoutPhase: storageContext.timeoutPhase,
+                        holderReason: timeoutSnapshot.currentReason || '',
+                        holderPhase: timeoutSnapshot.currentPhase || '',
+                        holderStartedAt: timeoutSnapshot.currentStartedAt || 0,
+                        holderEnqueuedAt: timeoutSnapshot.currentEnqueuedAt || 0,
+                        depth: timeoutSnapshot.depth || 0,
+                        oldestWaitMs: timeoutSnapshot.oldestWaitMs || 0,
+                        currentRunMs: timeoutSnapshot.currentRunMs || 0,
+                        timedOutCount: timeoutSnapshot.timedOut || 0
+                    })
+                    hooks.onTimeoutStallCheck(`${queueOptions.reason || 'storage-update'}-timeout`)
                     hooks.onTimeoutRecovery(
                         storageContext,
                         `${queueOptions.reason || 'storage-update'}-timeout`,
@@ -277,6 +325,7 @@ function createSerializedStorageUpdateQueue(options = {}) {
                 if(state.isAbandoned(updateToken)) {
                     storageContext.abandoned = true
                     storageContext.currentPhase = 'abandoned-before-start'
+                    hooks.recordEvent(makeStorageUpdateSettledEvent(storageContext, 'abandoned-before-start'))
                     hooks.incrementMetric('storageUpdate.skippedAbandoned')
                     hooks.finishCycle(cycle, 'abandoned', 'skipped-before-update-body', {
                         ...hooks.getJournalDetails(storageContext),
@@ -290,6 +339,10 @@ function createSerializedStorageUpdateQueue(options = {}) {
                     storageContext.deadlineMissed = true
                     hooks.incrementMetric('storageUpdate.deadlineMissed')
                 }
+                hooks.recordEvent(makeStorageUpdateSettledEvent(
+                    storageContext,
+                    storageContext.didTimeout ? 'completed-after-timeout' : 'completed'
+                ))
                 hooks.incrementMetric('storageUpdate.completed')
                 hooks.onCompleted(storageContext)
                 hooks.finishCycle(cycle, 'completed', '', {
@@ -326,6 +379,8 @@ function createSerializedStorageUpdateQueue(options = {}) {
             clearTimeoutFn(timeoutId)
         }).catch(error => {
             storageContext.fallbackReturned = true
+            // A timeout is recorded by its own event above. Any other failure is the update body throwing.
+            if(!storageContext.didTimeout) hooks.recordEvent(makeStorageUpdateSettledEvent(storageContext, 'failed'))
             hooks.incrementMetric('storageUpdate.fallbackReturned')
             if(storageContext.didTimeout) {
                 hooks.onTimeoutRecovery(

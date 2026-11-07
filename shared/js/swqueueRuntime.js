@@ -557,9 +557,19 @@ function createQueueRuntimeState() {
     // this queue's realistic size (hundreds of items, not millions) --
     // the cost that mattered in the incident this fixes was repeated full
     // WAL replay, not an in-memory sort.
+    // A resolve row is a post that still needs its profile read (6 Nov). It runs ahead of the profile rows, so a post is not held behind
+    // the whole backlog of profile rows. Within each group the queue sequence still decides the order.
+    function isResolveQueueRow(item) {
+        return item?.resolveProfileFromPage === true ||
+            `${item?.dedupeKey || ''}`.startsWith('resolve-profile:') ||
+            `${item?.coordinatorKey || ''}`.startsWith('resolve-profile:')
+    }
+
     function rebuildQueueOrder(queue = {}) {
         const sortedKeys = Object.entries(queue || {})
             .sort(([leftKey, leftItem], [rightKey, rightItem]) => {
+                const priorityDiff = (isResolveQueueRow(leftItem) ? 0 : 1) - (isResolveQueueRow(rightItem) ? 0 : 1)
+                if(priorityDiff) return priorityDiff
                 const leftSequence = Number.parseInt(leftItem?.queueSequence, 10) || 0
                 const rightSequence = Number.parseInt(rightItem?.queueSequence, 10) || 0
                 return leftSequence - rightSequence || leftKey.localeCompare(rightKey)

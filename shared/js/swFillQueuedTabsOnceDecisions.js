@@ -169,7 +169,7 @@ function createFillQueuedTabsOnceDecisions(deps = {}) {
         if(openReservationHref) {
             return {outcome: 'proceed', openReservationHref}
         }
-        releaseQueuedActivationGuard(next)
+        // The activation guard is claimed after the reservation now, so there is no guard to release here.
         if(openingActionKey) getQueuedTabFillOpeningActionKeys().delete(openingActionKey)
         queueRuntime.requeueActivationIntent(next, {
             source: 'runtime-effect'
@@ -552,7 +552,9 @@ function createFillQueuedTabsOnceDecisions(deps = {}) {
         }))
         void contentEnsurePromise.then(result =>
             handleQueuedTabContentScriptEnsureResult(tab.id, result, 'queued-tab-opened-return-after-durable-active')
-        )
+        ).catch(error => {
+            recordCoordinatorDiagnosticEvent('queued-tab-content-ensure-failed', error?.message || 'Queued tab content script ensure result failed')
+        })
         scheduleOwnedBlockedProfileSweep(next.ownerTabId, 750)
         void sweepOwnedBlockedProfileTabs(next.ownerTabId)
         scheduleCoordinatorQueueResume(1000, 'queued-tab-opened-return-after-durable-active', {

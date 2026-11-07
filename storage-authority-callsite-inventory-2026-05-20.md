@@ -1,5 +1,7 @@
 # Storage Authority Call-Site Inventory
 
+> **Status: REFERENCE** (24 Oct 2026). Storage call-site inventory, updated 7 Oct. Dated; re-run before relying on it. Reference or dated data. Check before relying on its numbers. Register: [notes register](docs/notes-register.md).
+
 Date: 2026-05-20
 Version slice: 1.6.376
 
@@ -153,7 +155,7 @@ rg -n "metricStorageSet\(" shared/js/sw.js
 | persistOwnedTabIdsByParent | mbOwnedTabState | Runtime ownership cache. | userMemoryNonAuthority | Keep out of queue/progress authority. |
 | mutateCoordinatorQueuedProfileTargetResolve | mbCoordinatorQueue, mbCoordinatorQueueWal, mbCoordinatorRuns, mbSpacePendingNukedPosts | Resolves profile-resolution row through `loadCoordinatorQueueRunsPendingProjection()`. | ordinaryMutation | Queue remap is WAL-backed; pending cleanup is derived materialization after durable queue authority. |
 | recordOwnedBlockedSweepTerminal | mbCoordinatorQueue, mbCoordinatorQueueWal, mbCoordinatorRuns | Terminalizes the matching active row after a live owned profile tab reports `close-if-blocked`; runs are saved as derived follow-up. | ordinaryMutation | Visible blocked state releases the slot without waiting for direct progress projection. |
-| recordActiveBlockedLiveTabTerminal | mbCoordinatorQueue, mbCoordinatorQueueWal, mbCoordinatorRuns | Sibling of recordOwnedBlockedSweepTerminal added 2026-09-17 (P3-2/P3-3, see sw-state-machine-decomposition-plan-2026-09-01.md) for `terminalizeActiveCoordinatorItemFromBlockedLiveTab`'s fallback: terminalizes the matching active row after a live tab found independently of queue-runtime tracking reports `close-if-blocked`; runs are saved as derived follow-up. | ordinaryMutation | Visible blocked state releases the slot without waiting for direct progress projection; matches by href/attempt identity, not tracked tabId, since this call site's confirming tab is never the item's own tracked tab. |
+| recordActiveBlockedLiveTabTerminal | mbCoordinatorQueue, mbCoordinatorQueueWal, mbCoordinatorRuns | Sibling of recordOwnedBlockedSweepTerminal added 2026-09-17 (P3-2/P3-3, see historical/sw-state-machine-decomposition-plan-2026-09-01.md) for `terminalizeActiveCoordinatorItemFromBlockedLiveTab`'s fallback: terminalizes the matching active row after a live tab found independently of queue-runtime tracking reports `close-if-blocked`; runs are saved as derived follow-up. | ordinaryMutation | Visible blocked state releases the slot without waiting for direct progress projection; matches by href/attempt identity, not tracked tabId, since this call site's confirming tab is never the item's own tracked tab. |
 | recoverPendingTabActionFromCoordinatorQueue | mbCoordinatorQueue | Read-only recovery of pending tab metadata. | displayRead | Keep read-only; use projection read helper later. |
 | validateProgressAttempt | mbCoordinatorQueue | Read-only stale-attempt validation. | displayRead | Keep read-only; use projection read helper later. |
 | shared/js/coordinator.js loadCoordinatorState | mbCoordinatorQueue, mbCoordinatorRuns, mbCoordinatorEvents, retry/pause flags | Dashboard read. | displayRead | Keep read-only; no authority mutation. |

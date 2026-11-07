@@ -1,5 +1,7 @@
 # Mute Block iPhone Safari Plan
 
+> **Status: ROADMAP** (24 Oct 2026). Future iPhone Safari plan, separate from the desktop queue. First version limited to foreground, user-directed actions. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: separate future-platform plan.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical
@@ -299,3 +301,26 @@ Selectors and timing are hardened across several real pages.
 - On iPhone Safari, a Quora question page shows one button to open the log page
 - No dependency on desktop-only Quora layout or desktop-only extension behavior
 - No unattended queued execution path is introduced for iPhone Safari
+
+## 2026-10-10 Review Alignment: Desktop Queue Work
+
+The October 2026 review of the current Chrome/Firefox working tree found
+performance costs in the desktop WAL append/read paths, dashboard recovery, and
+terminal-tab cleanup. Those findings apply to the existing desktop
+implementation; they do not change this plan's platform boundary or turn the
+desktop queue architecture into an iOS requirement.
+
+The iPhone product remains a separate Safari Web Extension in an iOS app, with
+no assumption of shared desktop code. Keep its first version foreground and
+user-directed, avoid unattended queued destructive actions, and keep local
+storage small. Do not port the desktop WAL/checkpoint/history/metrics machinery
+unless a future mobile design demonstrates a specific need that fits Safari's
+measured lifecycle and storage limits.
+
+Keep macOS and iOS evaluations distinct. A Mac is required for the planned
+Xcode, simulator, and Safari Web Inspector workflow. The API and lifecycle
+limitations documented here for iOS Safari should not be assumed to describe
+macOS Safari; evaluate that target separately if it becomes part of the product
+scope. Orion remains a possible real-device spike, not a replacement for the
+Safari plan absent reliable validation of Mute Block's content-script and
+interaction flow.

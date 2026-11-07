@@ -42,6 +42,9 @@ function createActivationGuardRuntime(deps = {}) {
     const {
         now: getNow = () => Date.now()
     } = deps
+    // A guard claim, release or prune changes what queued rows classify as (queued-activation-in-flight), so it bumps the executor input
+    // generation the apply pass checks before reusing its classification (22 Oct).
+    const bumpExecutorInput = typeof deps.bumpExecutorInputGeneration === 'function' ? deps.bumpExecutorInputGeneration : () => {}
     const {
         QUEUED_PROFILE_OPEN_RESERVATION_TTL_MS,
         QUEUED_ACTIVATION_GUARD_TTL_MS,
@@ -195,6 +198,7 @@ function createActivationGuardRuntime(deps = {}) {
     // Tell-tales for the slow-handoff investigation (2026-10-10): every claim, release, blocked hit,
     // and TTL prune of an activation guard is recorded with its key and holder.
     function recordActivationGuardEvent(kind, key = '', guard = {}) {
+        if (kind !== 'activation-guard-hit') bumpExecutorInput()
         recordFlightRecorderEvent({
             kind,
             source: 'activationGuardRuntime',

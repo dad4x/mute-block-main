@@ -3,7 +3,7 @@ const path = require('path')
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 9222
-const DEFAULT_EXTENSION_ID = 'ajcjckiafbnhioeafaejlaehkmdcdeha'
+const DEFAULT_EXTENSION_ID = 'kmnnjpcadjhphekdimhpihnaghbbpbhe'
 const DEFAULT_CHROME_DEV_PATH = path.resolve(__dirname, '..', '..', '..', 'chrome-dev')
 
 function getOption(name, fallback = '') {
@@ -401,11 +401,43 @@ async function runMain(main) {
     }
 }
 
+// The worker's message, sent from an extension page (decision 32, route a). The worker cannot message itself, so the message goes from
+// an extension page: the first one in the target list, or a coordinator page opened in the background when none is open.
+async function sendFromExtensionPage(config, message) {
+    const extensionPrefix = `chrome-extension://${config.extensionId}/`
+    const findExtensionPage = targets => targets.find(target => target.type === 'page' && (target.url || '').startsWith(extensionPrefix))
+    let page = findExtensionPage(await getTargets(config))
+    if(!page) {
+        const versionInfo = await getJson('/json/version', config)
+        await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
+            url: `${extensionPrefix}coordinator.html`,
+            background: true
+        }, 10000)
+        page = findExtensionPage(await getTargets(config))
+    }
+    if(!page) throw new Error('no extension page is open to send the message from')
+    const reply = await evaluate(page.webSocketDebuggerUrl, `chrome.runtime.sendMessage(${JSON.stringify(message)})`, 20000)
+    if(!reply || typeof reply !== 'object') throw new Error(`the worker did not answer ${message.action}`)
+    return reply
+}
+
+// The profile progress, read through the worker. Resolves to the records keyed by profile href, the shape the progress view's records had.
+async function readProfileNukeProgressFromWorker(config = getCdpConfig()) {
+    const reply = await sendFromExtensionPage(config, {action: 'get-profile-nuke-progress'})
+    return reply.profileNukeProgress && typeof reply.profileNukeProgress === 'object' ? reply.profileNukeProgress : {}
+}
+
+// The worker's clear of the whole progress (20 Oct review). Resolves to {cleared, saved, reason}.
+async function clearProfileNukeProgressThroughWorker(config = getCdpConfig()) {
+    return sendFromExtensionPage(config, {action: 'clear-profile-nuke-progress'})
+}
+
 module.exports = {
     DEFAULT_EXTENSION_ID,
     DEFAULT_CHROME_DEV_PATH,
     cdpCommand,
     cdpGet,
+    clearProfileNukeProgressThroughWorker,
     evaluate,
     getCdpConfig,
     getInstalledExtensions,
@@ -415,6 +447,7 @@ module.exports = {
     isSpacePageTarget,
     jsString,
     openChromeExtensionsPage,
+    readProfileNukeProgressFromWorker,
     resolveCdpConfig,
     resolveExtensionId,
     runMain,
