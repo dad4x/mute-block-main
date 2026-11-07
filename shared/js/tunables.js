@@ -134,6 +134,9 @@ module.exports = {
     PROFILE_SEARCH_COLLECT_LIMIT: 100,
     // A new search page starts on this time, "Collect for 00:10" (7 Nov). It is one of COLLECT_TIME_SECONDS.
     PROFILE_SEARCH_COLLECT_DEFAULT_SECONDS: 10,
+    // The worker status check (7 Nov): how long one ping waits for a reply, and how long to wait before the next ping.
+    WORKER_STATUS_PING_TIMEOUT_MS: 2000,
+    WORKER_STATUS_RETRY_MS: 1000,
     PROFILE_SEARCH_COLLECT_CHOICES: [25, 50, 100, 250, 500, 1000, 2000],
     // Collect for a time instead of a count (7 Nov): the dropdown offers these, in seconds, after the counts.
     COLLECT_TIME_SECONDS: [5, 10, 30, 60, 120, 300],

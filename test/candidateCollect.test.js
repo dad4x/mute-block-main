@@ -85,7 +85,7 @@ test('the label reads zero and the minute mark for a run that has just started o
 test('the space loop exit lines are unchanged: the run-state condition, the end-of-feed confirm, and the away-from-bottom stall', () => {
     const body = functionBody(contentSource, 'async function collectMoreSpaceFeedPosts(button)')
     const loop = runnerSource()
-    assert.match(body, /isStopRequested: \(\) => spaceFeedCollectStopRequested,\s*isDone: \(\) => isSpaceFeedCollectDone\(startCount, peakCount, limit\) \|\| isCollectTimeUp\(spaceFeedCollectProgress\.startedAt, spaceFeedCollectSeconds\),/)
+    assert.match(body, /isStopRequested: \(\) => spaceFeedCollectStopRequested,\s*isDone: \(\) => addedCount >= limit \|\| isCollectTimeUp\(spaceFeedCollectProgress\.startedAt, spaceFeedCollectSeconds\),/)
     // A pass that waited for a hidden tab counts as progress; every other pass is judged by collectPassMadeProgress (31 Oct).
     assert.match(body, /return resumed \|\| collectPassMadeProgress\(before, after\)/)
     assert.match(candidateSource, /return after\.count > before\.count \|\| after\.scrollY > before\.scrollY \|\| after\.scrollHeight > before\.scrollHeight/)

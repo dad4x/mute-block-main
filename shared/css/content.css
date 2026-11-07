@@ -423,6 +423,20 @@
    bottom: 84px (owner decision, option 3: keep the full label and sit above the Next notification pill). From the owner's screenshot the pill's top edge
    is about 66-68px above the viewport bottom (pill y 798 to 836 with the 28px Progress bar below it, in an ~866px-tall window), so 84px leaves a 16px gap above it.
    The pill is not in the DOM, so this is a measured offset, not a token. Same z-index as the search toolbar. */
+/* The popup's Stop collecting button sits where the space's does (7 Nov). */
+.mb-ext_modal-stop-btn {
+    position: fixed;
+    right: 44px;
+    bottom: 84px;
+    z-index: 2147483646;
+    margin: 0;
+    background-color: var(--mb-grey-900);
+    color: var(--mb-white);
+    border: 1px solid var(--mb-grey-900);
+    box-shadow: 0 1px 2px rgba(var(--mb-black-rgb), 0.12);
+    white-space: nowrap;
+}
+
 .mb-ext_space-collect-stop-btn,
 .mb-ext_profile-search-stop-btn {
     position: fixed;
@@ -836,4 +850,46 @@
     display: flex !important;
     align-items: center;
     gap: 8px;
+}
+
+/* The starting spinner, shown while the queue worker does not answer (7 Nov). */
+.mb-ext_worker-starting {
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    z-index: 2147483646;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 999px;
+    color: #111;
+    font: 12px/1.2 system-ui, -apple-system, sans-serif;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.mb-ext_worker-starting-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid #d1d5db;
+    border-top-color: #111;
+    border-radius: 50%;
+    animation: mb-ext-worker-spin 0.8s linear infinite;
+}
+
+@keyframes mb-ext-worker-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* The contributors popup's header wraps, and its Collect button keeps one width for its labels, so a change of label does not move the row (7 Nov). */
+.mb-ext_modal-header {
+    flex-wrap: wrap;
+    row-gap: 6px;
+}
+
+.mb-ext_modal-collect-btn {
+    min-width: 160px;
+    white-space: nowrap;
 }

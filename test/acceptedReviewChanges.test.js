@@ -454,8 +454,9 @@ register('the space Collect N More stops after N more are collected, and its cho
         extractFunction(contentSource, 'function getSpaceFeedCollectKey()'),
         extractFunction(contentSource, 'function ensureSpaceFeedCollectStateForCurrentSpace()'),
         extractFunction(contentSource, 'function setSpaceFeedCollectLimit(value)'),
-        extractFunction(contentSource, 'function getSpaceFeedCollectedSince(startCount, peakCount)'),
-        extractFunction(contentSource, 'function isSpaceFeedCollectDone(startCount, peakCount, limit)')
+        'let candidateKeysNow = new Set()',
+        'function getSpaceFeedCandidateKeys() { return candidateKeysNow }',
+        extractFunction(contentSource, 'function countSpaceFeedCandidatesAddedSince(startKeys = new Set())')
     ].join('\n'), context)
     const run = code => vm.runInContext(code, context)
 
@@ -467,17 +468,20 @@ register('the space Collect N More stops after N more are collected, and its cho
     run('setSpaceFeedCollectLimit(7)')
     assert.equal(run('spaceFeedCollectLimit'), 250, 'a value the dropdown does not offer is ignored')
 
-    // Five were collected at the press. The run stops once 100 more are counted on top of that.
-    assert.equal(run('isSpaceFeedCollectDone(5, 104, 100)'), false)
-    assert.equal(run('isSpaceFeedCollectDone(5, 105, 100)'), true)
-    assert.equal(run('getSpaceFeedCollectedSince(5, 3)'), 0, 'a dip in the count does not count as collected')
+    // Only candidates added since the press count. One already there at the press does not; a profile that got queued does not; a drop is not a count.
+    run("candidateKeysNow = new Set(['a', 'b', 'c', 'd'])")
+    assert.equal(run("countSpaceFeedCandidatesAddedSince(new Set(['a']))"), 3)
+    run("candidateKeysNow = new Set(['a', 'b'])")
+    assert.equal(run("countSpaceFeedCandidatesAddedSince(new Set(['a', 'c']))"), 1, 'c left the candidates (queued), so only b counts')
+    run("candidateKeysNow = new Set(['a'])")
+    assert.equal(run("countSpaceFeedCandidatesAddedSince(new Set(['a', 'b', 'c']))"), 0, 'a drop in the candidates is not counted as collected')
 
     location.pathname = '/space/B'
     run('ensureSpaceFeedCollectStateForCurrentSpace()')
     assert.equal(run('spaceFeedCollectLimit'), 100, 'another space starts at the default')
 
     const collectBody = extractFunction(contentSource, 'async function collectMoreSpaceFeedPosts(button)')
-    assert.match(collectBody, /isDone: \(\) => isSpaceFeedCollectDone\(startCount, peakCount, limit\)/)
+    assert.match(collectBody, /isDone: \(\) => addedCount >= limit/)
     assert.match(collectBody, /window\.scrollBy\(/)
     // The copy above the feed's buttons sits on its own row, first in the feed toolbar.
     assert.match(readRepoFile('shared/css/content.css'), /\.mb-ext_space-feed-toolbar > \.mb-ext_space-collect-feed-host \{\n    order: 1;/)

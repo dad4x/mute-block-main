@@ -121,10 +121,13 @@ function createAdaptiveCollectWait({floorMs = 500, ceilingMs = 10000} = {}) {
 
 // The stop reason a collect leaves on its button. The space page and the contributors popup both use it (4 Nov), so the words and the time
 // are the same in both places. noun names what was collected; endLabel says how the feed or list ended.
-function formatCollectEndNotice({stopped = false, collected = 0, endReached = false, stalled = false, elapsedMs = 0, noun = 'posts', endLabel = 'end of feed'} = {}) {
+// timeUp: a time-limited collect ran out of time (7 Nov). It says so instead of the end of the results.
+function formatCollectEndNotice({stopped = false, collected = 0, endReached = false, stalled = false, timeUp = false, elapsedMs = 0, noun = 'posts', endLabel = 'end of feed'} = {}) {
     if(stopped) return 'Stopped'
+    if(timeUp && collected < 1) return 'Time reached'
     if(collected < 1) return `No new ${noun}`
     const timed = ` · ${formatElapsed(elapsedMs)}`
+    if(timeUp) return `Collected ${collected} · time reached${timed}`
     if(stalled) return `Collected ${collected} · stalled${timed}`
     return endReached ? `Collected ${collected} · ${endLabel}${timed}` : `Collected ${collected}${timed}`
 }
@@ -159,12 +162,10 @@ function collectChoiceLabel(choice = {}) {
     return `Collect ${choice.limit} More`
 }
 
-// The Collecting label while a collect runs (6 Nov). In time mode it says the time left, as "Collecting for mm:ss"; a count shows staged of target.
-function formatCollectingLabel({staged = 0, target = 0, timeSeconds = 0, startedAt = 0, now = Date.now()} = {}) {
-    if (timeSeconds > 0) {
-        const elapsed = Math.max(0, Math.floor((now - (Number(startedAt) || now)) / 1000))
-        return `Collecting for ${formatMinutesSeconds(Math.max(0, timeSeconds - elapsed))}`
-    }
+// The Collecting label while a collect runs (6 Nov). In time mode it shows the chosen time and holds it: "Collecting for mm:ss". The
+// running clock is the Stop control's, not this button's (7 Nov). A count shows staged of target.
+function formatCollectingLabel({staged = 0, target = 0, timeSeconds = 0} = {}) {
+    if (timeSeconds > 0) return `Collecting for ${formatMinutesSeconds(timeSeconds)}`
     return `Collecting ${staged} / ${target}`
 }
 

@@ -3406,12 +3406,12 @@ test('profile search collector stages a bounded batch without queueing', () => {
     assert.match(collectBody, /nudgeProfileSearchLazyLoad\(\)/)
     assert.match(collectBody, /stageProfileSearchHrefs\(\[row\.href\]\)/)
     assert.match(collectBody, /saveProfileSearchCollectCursor\(rows\)/)
-    assert.match(collectBody, /formatCollectingLabel\(\{staged: getProfileSearchStagedHrefs\(\)\.length, target: targetStagedCount, timeSeconds: profileSearchCollectSeconds/)
+    assert.match(collectBody, /showCollectProgress\(\{collectButtons: \[button\], staged: getProfileSearchStagedHrefs\(\)\.length, target: targetStagedCount, timeSeconds: profileSearchCollectSeconds/)
     assert.match(collectBody, /isProfileSearchEndOfResultsVisible\(\) && !hasUnstagedProfileSearchQueueableRow\(\) && !hasProfileSearchLoadingIndicator\(\)/)
     assert.match(collectBody, /nudgeProfileSearchLazyLoad\(\)/)
     assert.match(collectBody, /stallTimeoutMs: COLLECT_STALLED_TIMEOUT_MS/)
     assert.doesNotMatch(collectBody, /madeProgress \|\| hasUnstagedProfileSearchQueueableRow\(\)/)
-    assert.match(collectBody, /Collected \$\{collectedCount\}/)
+    assert.match(collectBody, /formatCollectEndNotice\(\{\n\s*stopped: profileSearchCollectStopRequested,\n\s*collected: collectedCount,/)
     assert.doesNotMatch(collectBody, /nukeProfileSearchHrefs\(/)
     assert.doesNotMatch(collectBody, /enqueueCoordinatorProfileUrls/)
     assert.match(batchBody, /const stagedHrefs = getProfileSearchStagedHrefs\(\)/)
@@ -3524,7 +3524,8 @@ test('service-worker-owned status is visible to source-page run waits', () => {
     assert.match(cleanupMessageBody, /cleanup: true/)
     assert.match(waitBody, /getOwnedNukeStatus\(\{runId: options\.runId \|\| ''\}\)/)
     assert.match(contentSource, /waitForOwnedNukeTabsToDrain\(btn, 180000, 1000, \{runId: result\?\.runId \|\| ''\}\)/)
-    assert.match(contentSource, /waitForOwnedNukeTabsToDrain\(buttons\.nuke, 180000, 1000, \{runId: result\?\.runId \|\| '', allowPause: true\}\)/)
+    // The popup's batch now runs the space's batch, so the source-page wait is the space's call (7 Nov).
+    assert.match(contentSource, /await waitForOwnedNukeTabsToDrain\(btn, 180000, 1000, \{runId: result\?\.runId \|\| ''\}\)/)
 })
 
 test('progress-to-queue legacy import path is absent', () => {
@@ -5092,8 +5093,9 @@ test('Stop collecting on space and search pages is fixed at the bottom, its left
     assert.ok(Math.abs((1064 - 18 - 139.5) - 906.5) < 0.05, 'the measured Collect left edge follows from the toolbar gap and the Collect width at a 1064px layout')
     assert.match(stopRule[0], /z-index:\s*2147483646;/)
     assert.match(css, /\.mb-ext_space-collect-stop-btn\[hidden\][\s\S]*display: none;/)
-    // The space sync adds the button to the body on first use, and the removal on the page never takes it mid-run.
-    assert.match(extractFunction(source, 'function syncSpaceFeedStopButtons()'), /document\.body\?\.appendChild\(stopButton\)/)
+    // The space sync adds the button to the body on first use (in the shared stop control), and the removal on the page never takes it mid-run.
+    assert.match(readRepoFile('shared/js/collectStopControl.js'), /getDocument\(\)\.body\?\.appendChild\(stopButton\)/)
+    assert.match(extractFunction(source, 'function syncSpaceFeedStopButtons()'), /spaceCollectStop\.sync\(\)/)
     assert.match(extractFunction(source, 'function removeSpaceCollectButtons()'), /if\(!spaceFeedCollecting\) document\.querySelector\('\.mb-ext_space-collect-stop-btn'\)\?\.remove\(\)/)
 
     // Hover help through the shared helper, so the prefix is the one muteBlockHelp.js owns.
@@ -5106,7 +5108,7 @@ test('Stop collecting on space and search pages is fixed at the bottom, its left
     const toolbarBody = extractFunction(source, 'function getProfileSearchToolbar()')
     assert.doesNotMatch(toolbarBody, /createProfileSearchStopButton/)
     assert.match(toolbarBody, /toolbar\.appendChild\(collectWrap\)\s*document\.body\.appendChild\(toolbar\)/)
-    assert.match(extractFunction(source, 'function syncProfileSearchStopButton()'), /document\.body\?\.appendChild\(stopButton\)/)
+    assert.match(extractFunction(source, 'function syncProfileSearchStopButton()'), /profileSearchCollectStop\.sync\(\)/)
     assert.match(css, /\.mb-ext_profile-search-stop-btn\[hidden\]/)
 })
 
@@ -5119,14 +5121,17 @@ test('the Stop collecting label on both pages comes from the shared candidateCol
     assert.match(source, /const \{formatCollectStopLabel, formatCollectEndNotice, formatElapsed, STOP_COLLECT_LABEL_TEXT\} = require\('\.\/candidateCollect'\)/)
     assert.match(extractFunction(source, 'function createSpaceCollectStopButton()'), /button\.textContent = STOP_COLLECT_LABEL_TEXT/)
     assert.match(extractFunction(source, 'function createProfileSearchStopButton()'), /button\.textContent = STOP_COLLECT_LABEL_TEXT/)
-    assert.match(extractFunction(source, 'function refreshSpaceFeedStopLabel()'), /formatCollectStopLabel\(\{/)
-    assert.match(extractFunction(source, 'function refreshProfileSearchStopLabel()'), /formatCollectStopLabel\(\{/)
+    // The label and the timer live in the one shared control (collectStopControl.js), which both pages use.
+    assert.match(readRepoFile('shared/js/collectStopControl.js'), /formatCollectStopLabel\(\{/)
+    assert.match(source, /const spaceCollectStop = createCollectStopControl\(\{/)
+    assert.match(source, /const profileSearchCollectStop = createCollectStopControl\(\{/)
     assert.doesNotMatch(source, /Stop collecting · /)
     // The timer ticks once per COLLECT_STOP_LABEL_TICK_MS while a run is active, and is cleared when the run ends.
-    assert.match(spaceSync, /setInterval\(refreshSpaceFeedStopLabel, COLLECT_STOP_LABEL_TICK_MS\)/)
-    assert.match(spaceSync, /clearInterval\(spaceFeedStopLabelTimer\)/)
-    assert.match(searchSync, /setInterval\(refreshProfileSearchStopLabel, COLLECT_STOP_LABEL_TICK_MS\)/)
-    assert.match(searchSync, /clearInterval\(profileSearchStopLabelTimer\)/)
+    assert.match(readRepoFile('shared/js/collectStopControl.js'), /setIntervalFn\(refreshLabel, tickMs\)/)
+    assert.match(readRepoFile('shared/js/collectStopControl.js'), /clearIntervalFn\(timer\)/)
+    assert.match(source, /tickMs: COLLECT_STOP_LABEL_TICK_MS,/)
+    assert.match(spaceSync, /spaceCollectStop\.sync\(\)/)
+    assert.match(searchSync, /profileSearchCollectStop\.sync\(\)/)
     assert.match(readRepoFile('shared/js/tunables.js'), /COLLECT_STOP_LABEL_TICK_MS: 1000/)
     // Each run starts its counters, and the start of the run goes to the shared sync before the loop runs.
     assert.match(extractFunction(source, 'async function collectMoreSpaceFeedPosts(button)'), /spaceFeedCollectProgress = \{startedAt: Date\.now\(\), passes: 0, collected: 0, target: spaceFeedCollectLimit\}\s*syncSpaceFeedStopButtons\(\)/)
@@ -5297,7 +5302,7 @@ test('E4 and the wording: the per-post button reads Nuking... with no count, and
     assert.match(content, /setNukeButtonWorking\(queueButton, formatProfileRowState\('nuking'\)\)/)
     assert.match(content, /'end-of-results': 'End of search results'/)
     assert.match(content, /'end-of-feed': 'End of search results'/)
-    assert.match(content, /end of search results`/)
+    assert.match(content, /endLabel: 'end of search results'/)
     assert.equal(content.includes("'End of results'"), false)
     assert.equal(content.includes('· end of results`'), false)
     // The internal reason string stays as it was: it is an identifier in the flight recorder.
@@ -5409,19 +5414,6 @@ test('a modal row is queueable only with its blue Follow button, contributors in
     assert.match(observer, /needsLateModalActions/)
     assert.match(observer, /!activeModalButtons\.nuke/)
     assert.match(observer, /injectModalOpenProfilesBtn\(\)/)
-})
-
-test('modal contributor nuking keeps small tab concurrency and sends the whole kept batch, as a space batch does (4 Nov)', () => {
-    const source = readRepoFile('shared/js/content.js')
-    const helper = extractFunction(source, 'function getModalProfileNukeProfilesPerBatch()')
-    const body = extractFunction(source, 'async function nukeModalProfiles()')
-
-    assert.match(source, /MODAL_PROFILE_NUKE_PROFILES_PER_BATCH = 3/)
-    assert.match(helper, /Math\.min\(value, MODAL_PROFILE_NUKE_PROFILES_PER_BATCH\)/)
-    assert.match(body, /const maxConcurrent = getModalProfileNukeProfilesPerBatch\(\)/)
-    assert.match(body, /const queueLimit = Math\.max\(1, getModalQueueableUrls\(modal, items\)\.length\)/)
-    assert.match(body, /urlsToQueue\.length < queueLimit/)
-    assert.match(body, /if\(urlsToQueue\.length >= queueLimit\) break/)
 })
 
 test('same-attempt terminal success reconciles stale failed coordinator rows', () => {

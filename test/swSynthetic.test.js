@@ -46069,6 +46069,7 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         formatCollectStopLabel: require('../shared/js/candidateCollect').formatCollectStopLabel,
         isCollectTimeUp: require('../shared/js/candidateCollect').isCollectTimeUp,
         formatCollectingLabel: require('../shared/js/candidateCollect').formatCollectingLabel,
+        createCollectStopControl: require('../shared/js/collectStopControl').createCollectStopControl,
         collectChoiceLabel: require('../shared/js/candidateCollect').collectChoiceLabel,
         parseCollectChoice: require('../shared/js/candidateCollect').parseCollectChoice,
         collectTimeValue: require('../shared/js/candidateCollect').collectTimeValue,
@@ -46085,7 +46086,7 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         COLLECT_STOP_LABEL_TICK_MS: require('../shared/js/tunables').COLLECT_STOP_LABEL_TICK_MS,
         setInterval: fn => { state.tick = fn; state.timersStarted += 1; return state.timersStarted },
         clearInterval: () => { state.tick = null; state.timersCleared += 1 },
-        readSpaceFeedCollectedCount: () => state.queueable,
+        getSpaceFeedCandidateKeys: () => new Set(Array.from({length: state.queueable}, (_, index) => 'k' + index)),
         sleep: async() => {
             state.pass += 1
             state.hiddenDuringRun.push(stopButton.hidden)
@@ -46101,13 +46102,17 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         'let spaceFeedCollectSeconds = 0',
         'function currentSpaceFeedCollectLabel() { return collectChoiceLabel(spaceFeedCollectSeconds ? {seconds: spaceFeedCollectSeconds} : {limit: spaceFeedCollectLimit}) }',
         'let spaceFeedCollectProgress = {startedAt: 0, passes: 0, collected: 0, target: 0}',
-        'let spaceFeedStopLabelTimer = 0',
+        // The two Stop collecting controls, sliced out of content.js (7 Nov).
+        contentSource.slice(contentSource.indexOf('// The two Stop collecting controls'), contentSource.indexOf('})', contentSource.indexOf('const profileSearchCollectStop = createCollectStopControl({')) + 2),
+        contentFunctionSource(contentSource, 'function applyCollectNukeGate('),
+        contentSource.slice(contentSource.indexOf('// The display every collect shows'), contentSource.indexOf('\n}', contentSource.indexOf('function endCollectDisplay(')) + 2),
+        contentFunctionSource(contentSource, 'function spaceCollectButtons()'),
+        contentFunctionSource(contentSource, 'function spaceNukeButtons()'),
         'const spaceFeedPosterProfileHrefs = new Set()',
         'const spaceFeedQueuedProfileHrefs = new Set()',
         'async function safeSendRuntimeMessage(message, fallback = null) { return fallback }',
         contentFunctionSource(contentSource, 'async function weedSpaceFeedPosterRows()'),
-        contentFunctionSource(contentSource, 'function getSpaceFeedCollectedSince(startCount, peakCount)'),
-        contentFunctionSource(contentSource, 'function isSpaceFeedCollectDone(startCount, peakCount, limit)'),
+        contentFunctionSource(contentSource, 'function countSpaceFeedCandidatesAddedSince(startKeys = new Set())'),
         contentFunctionSource(contentSource, 'function setSpaceFeedCollectButtons(setLabel)'),
         contentFunctionSource(contentSource, 'function createSpaceCollectStopButton()'),
         contentFunctionSource(contentSource, 'function requestSpaceFeedCollectStop()'),
@@ -46166,6 +46171,7 @@ function makeSearchCollectHarness(stopOnPass = 0) {
         formatCollectStopLabel: require('../shared/js/candidateCollect').formatCollectStopLabel,
         isCollectTimeUp: require('../shared/js/candidateCollect').isCollectTimeUp,
         formatCollectingLabel: require('../shared/js/candidateCollect').formatCollectingLabel,
+        createCollectStopControl: require('../shared/js/collectStopControl').createCollectStopControl,
         collectChoiceLabel: require('../shared/js/candidateCollect').collectChoiceLabel,
         parseCollectChoice: require('../shared/js/candidateCollect').parseCollectChoice,
         collectTimeValue: require('../shared/js/candidateCollect').collectTimeValue,
@@ -46221,7 +46227,12 @@ function makeSearchCollectHarness(stopOnPass = 0) {
         'let profileSearchProcessedFollowButtons = new WeakSet()',
         'let profileSearchCollectCursorScrollY = 0',
         'let profileSearchCollectProgress = {startedAt: 0, passes: 0, collected: 0, target: 0}',
-        'let profileSearchStopLabelTimer = 0',
+        // The two Stop collecting controls (7 Nov), sliced out of content.js as the space sandbox does.
+        contentSource.slice(contentSource.indexOf('// The two Stop collecting controls'), contentSource.indexOf('})', contentSource.indexOf('const profileSearchCollectStop = createCollectStopControl({')) + 2),
+        contentFunctionSource(contentSource, 'function applyCollectNukeGate('),
+        contentSource.slice(contentSource.indexOf('// The display every collect shows'), contentSource.indexOf('\n}', contentSource.indexOf('function endCollectDisplay(')) + 2),
+        contentFunctionSource(contentSource, 'function spaceCollectButtons()'),
+        contentFunctionSource(contentSource, 'function spaceNukeButtons()'),
         // The Considered line and its cause (27 Oct). The label table is a const, so its declaration is sliced out of content.js.
         'let profileSearchConsideredText = \'\'',
         'let profileSearchConsideredCause = \'\'',
@@ -46318,10 +46329,11 @@ test('Stop collecting on space and search pages is not in the toolbar or the rig
     assert.doesNotMatch(toolbarBody, /createProfileSearchStopButton/)
     assert.match(toolbarBody, /toolbar\.appendChild\(collectWrap\)\s*document\.body\.appendChild\(toolbar\)/)
     const syncBody = contentFunctionSource(contentSource, 'function syncProfileSearchStopButton()')
-    assert.match(syncBody, /document\.body\?\.appendChild\(stopButton\)/)
+    assert.match(syncBody, /profileSearchCollectStop\.sync\(\)/)
+    assert.match(require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'shared/js/collectStopControl.js'), 'utf8'), /getDocument\(\)\.body\?\.appendChild\(stopButton\)/)
     // The space page's right column does not hold the Stop button any more, and its sync adds the button to the body on first use.
     assert.doesNotMatch(contentFunctionSource(contentSource, 'function ensureSpaceCollectWrapInRightColumn()'), /createSpaceCollectStopButton/)
-    assert.match(contentFunctionSource(contentSource, 'function syncSpaceFeedStopButtons()'), /document\.body\?\.appendChild\(stopButton\)/)
+    assert.match(contentFunctionSource(contentSource, 'function syncSpaceFeedStopButtons()'), /spaceCollectStop\.sync\(\)/)
 
     // The CSS rule: fixed, at the bottom, with the same stacking as the toolbar and no hard-coded colours.
     const rule = css.match(/\.mb-ext_space-collect-stop-btn,\s*\n\.mb-ext_profile-search-stop-btn \{([^}]*)\}/)

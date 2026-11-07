@@ -39,8 +39,14 @@ let currentQueueBarSummary = null
 
 // Records a summary and reports whether its total or pending count changed. updatedAt alone is not a change, so a heartbeat
 // that moves no count pushes nothing.
+// The highest total seen while the queue has work (7 Nov). A finished row leaves the live queue, so the live total falls as the work is
+// done; the bar's total is the run's work, so it holds, and the done count is what rises. It starts again once the queue is empty.
+let runPeakTotal = 0
+
 function recordQueueBarSummary(fields = {}) {
-    const next = makeQueueBarSummary(fields)
+    const incoming = makeQueueBarSummary(fields)
+    runPeakTotal = incoming.pending > 0 ? Math.max(runPeakTotal, incoming.total) : 0
+    const next = {...incoming, total: incoming.pending > 0 ? runPeakTotal : incoming.total}
     const previous = currentQueueBarSummary
     const changed = !previous || previous.total !== next.total || previous.pending !== next.pending
     currentQueueBarSummary = next

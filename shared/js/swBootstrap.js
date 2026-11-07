@@ -20,6 +20,7 @@ const {namespaceChanges} = require('./storageNamespace')
 
 const {QUEUE_BAR_GET_ACTION, getQueueBarSummary, summarizeQueueBarView, recordQueueBarSummary, subscribeQueueBarTab, pushQueueBarSummary} = require('./swQueueBarSummary')
 const {PROFILE_NUKE_PROGRESS_CLEAR_ACTION, PROFILE_NUKE_PROGRESS_GET_ACTION} = require('./swProfileNukeProgressPush')
+const {WORKER_STATUS_ACTION} = require('./workerStatus')
 
 function registerServiceWorkerListeners(deps = {}) {
     const {
@@ -813,6 +814,10 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'remove-coordinator-failed-work-item') {
             return removeCoordinatorFailedWorkItem(request)
+        }
+        else if(request.action === WORKER_STATUS_ACTION) {
+            // The page's check that the worker is up (7 Nov). It answers at once, before the queue loads.
+            return Promise.resolve({ready: true})
         }
         else if(request.action === QUEUE_BAR_GET_ACTION) {
             // The queue bar's summary, as the worker holds it (decisions 9 and 11). Null until a queue view has been recorded. The asking
