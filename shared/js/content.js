@@ -3042,6 +3042,9 @@ function syncNukingToolbarStatus(host, anchor, text, left = 0, showsControl = nu
 function setNukeButtonIdle(button, label = `Nuke 'Em`) {
     if(!button) return
     detachNukingControl(button)
+    // Nuke 'Em with a count of 0 is always disabled (owner, 7 Nov). Set here, so no label writer can leave a 0 enabled.
+    const idleCount = /Nuke 'Em (\d+)$/.exec(label)
+    if(idleCount) button.disabled = Number(idleCount[1]) === 0
     if(button.dataset.mbNukeState === 'idle' && button.innerText === label &&
         !button.classList.contains('mb-ext_nuke-profiles-btn--flash') &&
         !button.classList.contains('mb-ext_nuke-profiles-btn--pressed') &&
@@ -11844,6 +11847,10 @@ async function nukeSpaceFeedEntries(button, entries) {
             delete button.dataset.mbQueueing
         },
         afterFinish: async() => {
+            // The run is over, so a button it left in the working state goes back to idle. Nothing else repaints the popup's Nuke 'Em (its
+            // render skips a working button), so the popup is repainted here. The top button is repainted by the sync below.
+            if(button.dataset.mbNukeState === 'working') setNukeButtonIdle(button)
+            if(button.closest?.('[role=dialog]')) injectModalOpenProfilesBtn()
             for(const entry of unfinishedEntries) {
                 if(entry?.postKey) {
                     spaceFeedNukingPostKeys.delete(entry.postKey)

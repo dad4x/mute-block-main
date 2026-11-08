@@ -459,7 +459,8 @@
 }
 
 .mb-ext_space-collect-stop-btn[hidden],
-.mb-ext_profile-search-stop-btn[hidden] {
+.mb-ext_profile-search-stop-btn[hidden],
+.mb-ext_modal-stop-btn[hidden] {
     display: none;
 }
 

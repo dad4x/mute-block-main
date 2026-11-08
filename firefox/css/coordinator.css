@@ -1054,6 +1054,19 @@ a.row-subtitle:hover {
     width: 100%;
 }
 
+/* The #progress page's bar sits at the bottom edge of the worker window (owner, 7 Nov): the view fills the window and the bar takes the
+   bottom of it, with its top edge marked the way the other bars mark theirs. */
+#workerBarView:not([hidden]) {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+#workerBarView > #workerBar {
+    border-top: 1px solid var(--mb-grey-200);
+    margin-top: auto;
+}
+
 .worker-bar-brand {
     align-items: center;
     display: flex;

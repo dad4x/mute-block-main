@@ -21,7 +21,7 @@ function pauseButtonLabel(paused, pending) {
 }
 
 // Builds the bar on the current page and returns its handle. The logo is a link to the Mute Block site (queueProgressBar.js); `onPauseClick`
-// runs when Pause or Resume is pressed. The bar is hidden until update() says the queue has work left.
+// runs when Pause or Resume is pressed. The bar stays on its page whether or not the queue has work (owner, 7 Nov).
 function createQueueBottomBar({onPauseClick = null} = {}) {
     const pauseButton = document.createElement('button')
     pauseButton.type = 'button'
@@ -37,25 +37,21 @@ function createQueueBottomBar({onPauseClick = null} = {}) {
         interactive: true,
         controls: [pauseButton]
     })
-    progress.bar.style.display = 'none'
     document.body.appendChild(progress.bar)
 
     let paused = false
     let pending = ''
-    let hasWork = false
     function paint() {
         pauseButton.textContent = pauseButtonLabel(paused, pending)
         pauseButton.disabled = pending !== ''
-        progress.bar.style.display = hasWork ? 'flex' : 'none'
     }
 
     return {
         bar: progress.bar,
-        // The page's numbers. hasWork is true while the queue has work left, which is when the bar shows.
-        update({percent = 0, label = '', hasWork: work = false, paused: isPaused = false}) {
+        // The page's numbers.
+        update({percent = 0, label = '', paused: isPaused = false}) {
             progress.setProgress(percent, label)
             paused = isPaused
-            hasWork = work
             paint()
         },
         // The Pause or Resume request in flight: 'pause', 'resume', or '' when none is.
@@ -80,7 +76,6 @@ async function refreshQueueBarFromSummary(bar, browserApi) {
     bar.update({
         percent: display.percent,
         label: `${display.terminal} / ${display.total}`,
-        hasWork: display.visible,
         paused
     })
     return {paused}

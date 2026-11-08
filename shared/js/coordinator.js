@@ -1668,11 +1668,10 @@ function renderDashboardBottomBar(queueItems = []) {
     const total = getQueueTotalCount(queueItems)
     const terminal = getQueueTerminalCount(queueItems)
     installQueueBottomBar()
+    // The bar stays on the dashboard whether or not the queue has work (owner, 7 Nov; it used to vanish when the queue was empty, 4 Nov).
     queueBottomBar.update({
         percent: total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0,
         label: `${terminal} / ${total}`,
-        // The rule (owner, 4 Nov): the bar is there while there is work to be done, and vanishes when the queue is empty.
-        hasWork: total > 0 && terminal < total,
         paused: state.paused
     })
 }
