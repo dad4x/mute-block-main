@@ -1,6 +1,100 @@
 # Shared Moderation Publication Design, 2026-05-18
 
+> **Status: ROADMAP** (24 Oct 2026). Core design of shared-moderation publication (18 May). Runtime integration deferred. The pure module exists and no runtime file imports it. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: active supporting design, runtime integration deferred.
+
+## 27 Oct 2026 decisions and open questions
+
+Folded in from a 27 Oct planning pass. Each item is marked **owner** (stated by the owner on 27 Oct), **proposed** (a suggestion not yet confirmed), or **open** (no decision). Owner items override older text in this note where they conflict. Proposed items override older text only once the owner confirms them.
+
+### Phases
+
+1. Reasons on queue and history rows (owner).
+2. Export tracking in history (owner).
+3. Manual export, on the public and private channels (owner for the channels; manual-first proposed).
+4. Review-only import (proposed). Dead Hand is out of 2.0 (owner).
+
+No version numbers are assigned to these phases (owner).
+
+### Channels
+
+- **Public**: the shared moderation journal. Other people read it. Posts are moderate in size (owner).
+- **Private**: roaming configuration and the user's own cross-browser record. Posts can be large, so import is simple (owner).
+- **One preference Space per channel**, set in Preferences, with a default for each (owner). The default value is open.
+- **Scripted creation** of a Space, with the right permissions, when needed (owner). Whether the extension can do it is open. It must be an explicit user action, never automatic (proposed).
+- **Followers-only**: a private Space is readable only by followers who are explicitly accepted (owner). This corrects the earlier statement that Quora has no private posts.
+
+### Reasons
+
+- A reason is a label the user chooses on a block action. The Asset, Target and must-block buttons each get a dropdown with checkmarks. Several may be checked (owner).
+- Space reasons are persistent: a Space's checked reasons are remembered and shown as its default (owner).
+- Each operation (Space, search, or individual) copies the checked reasons into its queue rows, and they are kept on the history rows (proposed).
+- The field is `reason`. It is not "classification", which means Asset, Target and Neutral (owner, 25 Oct).
+- CSAM is selectable as the user's own label. It records what that user believes, not a judgment of ours. It is never set automatically (owner, 27 Oct). The Blockzooka note flags this area as legally sensitive, because that project published a list of specific criteria in a public repository. The owner's position covers the local field. It does not settle publication (see open questions).
+- Narrower reasons count as broader in reports: store exact checks and expand at report time (proposed).
+- Published repo text carries the reason name only, not the criteria wording (proposed).
+
+### Export tracking in history
+
+- A history row carries a shared mark: channel, Space, post id, time, and sequence. A row with no mark is pending (proposed). This replaces a separate outbox, because it overlaps history (owner).
+- The mark is written only after a read-back of the posted entry (proposed). This confirms the post exists and prevents double posting. It is not a trust check.
+- Pending rows may age out before export. This is accepted (owner).
+- Space classification changes are not history rows today. They need the same mark, as dated events (proposed).
+
+### Trust and pairs
+
+- **Trust is the Space's classification, set by the user.** Marking a Space as Asset trusts every poster there until the Space is reclassified (owner). A single-author check is not required for that (owner).
+- **Trust is set at the moment of the action.** An export does not re-check trust (owner).
+- **Mute and block are one atomic action** for export, tied by one action run id (owner).
+- A profile whose mute and block disagree is a bookkeeping problem in the state machine, not a sharing problem (owner).
+- **A pardon cancels a pending block.** If the block was already shared, the pardon goes in a newer post. Old posts are never edited (owner).
+- A subscriber who has already applied a block decides what to do with a pardon. That is outside the export.
+- Dead Hand (automatic action from other people's journals) is out of 2.0 (owner).
+
+### Edge: a Space changes hands
+
+Example: "The Real Q Mods" was an Asset space, was taken over, and is now a Target.
+
+- Each history row records the Space's classification as it was when the action happened. Actions taken while it was Asset stay valid under the trust-at-action rule (proposed).
+- Reclassifying a Space as Target stops imports from it. Pending imported items from it are withdrawn, not applied (proposed).
+- Classification changes are dated events, so history can show when trust changed (proposed).
+- Returning a Space to Asset is a new user decision. Nothing restores trust automatically (proposed).
+- **Open:** whether reports should flag blocks made during a takeover period.
+- **Open:** what an export does if its destination is taken over.
+
+### Roaming and takeover
+
+- The same-account rule in this note applies `space.classification.set` from the roaming profile automatically. A takeover of the Space that holds the roaming profile would change classifications in every browser that follows it. This is an existing risk, widened by roaming.
+- **Proposed:** roaming configuration never changes local trust without a local accept. A classification from another browser appears as an accept-or-ignore prompt. Not confirmed by the owner. If confirmed, this supersedes the automatic apply in the same-account rule.
+- Signing the roaming document with a key stored in each browser is a later option. It is not decided.
+
+### Export cadence
+
+- The daily automatic post with a threshold of about 10 events, described earlier in this note, is the later step (proposed). The first step is manual export, through Publish Now.
+- What an export lands on and does is open (owner).
+
+### Toolbar
+
+- Left click opens the Dashboard (unchanged).
+- Right click gives a menu: Dashboard, Preferences, History, Export (owner). What Export does is open.
+- The right-click menu needs the `contextMenus` permission, which is not declared today. Whether Chrome shows an install prompt for it is unchecked (proposed).
+
+### Open questions for export
+
+- **Contents of an export**: events since the last mark (proposed).
+- **Post size**: the Quora limit is unknown and needs a live test at increasing sizes. Public posts are moderate; private posts can be large (owner).
+- **Deletion**: whether a user can delete or hide their own posts is unknown. It decides how much public history is accepted.
+- **Author visibility**: whether Quora shows the author of Space posts.
+- **Reasons on public posts**: open. Publishing "this user thinks X" beside a named profile is not settled by the CSAM position above.
+- **Composer**: manual posting, where the user clicks Post, is proposed. Automated composing is open.
+
+### Live checks needed
+
+- Read and post in a Space the user owns, using the logged-in session.
+- Create a Space with the right permissions (scripted creation), and whether that is allowed at all.
+- The followers-only flow: how followers are accepted, and whether the user's other browsers can be accepted without a manual step each time.
+- Post size limit, post author display, whether the JSON markers survive, and whether a post can be deleted or hidden.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical
 architecture starts at [architecture.md](architecture.md). This note remains the

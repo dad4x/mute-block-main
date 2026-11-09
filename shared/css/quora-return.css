@@ -1,0 +1,23 @@
+/* The "Return to Quora" line and its wordmark link. The dashboard, the History page and the Preferences page all load this one file (6 Nov). */
+.quora-return {
+    color: var(--mb-grey-800);
+    font-size: 13px;
+    white-space: nowrap;
+}
+
+.quora-return .quora-home-link {
+    font-size: 16px;
+}
+
+.quora-home-link {
+    color: var(--mb-brand-red);
+    display: inline-block;
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 18px;
+    font-weight: 700;
+    text-decoration: none;
+}
+
+.quora-home-link:hover {
+    text-decoration: underline;
+}

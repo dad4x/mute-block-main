@@ -1,0 +1,12 @@
+{
+  "name": "Progress split probe",
+  "version": "0.0.1",
+  "manifest_version": 3,
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "permissions": [
+    "storage",
+    "unlimitedStorage"
+  ]
+}

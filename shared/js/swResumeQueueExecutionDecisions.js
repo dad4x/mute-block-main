@@ -1,19 +1,20 @@
 // Resume-queue-execution decide functions extracted from sw.js (decomposition
 // Slices P2-18 through P2-21): decideResumeCoordinatorLocallyPausedOutcome,
 // decideResumeCoordinatorStoredPausedOutcome, decideResumeShouldRevalidateFillOutcome,
-// decideResumeShouldUseFallbackOutcome, decideResumeRawQueueFallbackItems,
-// decideResumeWalQueueFallbackItems, decideResumeCoordinatorQueueExecutionOnceOutcome.
-// All seven were decomposed out of resumeCoordinatorQueueExecutionOnce, which
-// remains in sw.js and calls back into each of these in turn.
+// decideResumeShouldUseFallbackOutcome, decideResumeWalQueueFallbackItems,
+// decideResumeCoordinatorQueueExecutionOnceOutcome. All six were decomposed out of
+// resumeCoordinatorQueueExecutionOnce, which remains in sw.js and calls back into
+// each of these in turn. The raw legacy queue fallback (decideResumeRawQueueFallbackItems)
+// is retired (D1, D2) and no longer lives here.
 //
 // This module's construction call in sw.js is placed after
 // swSchedulerAlarmBookkeeping's destructure (isCoordinatorPauseRequestedLocally
-// and normalizeRawCoordinatorQueueForReconcileFallback come from there) even
-// though these functions' original source-text location was earlier in the
-// file -- as plain hoisted function declarations they could close over those
-// names before they were assigned, since they're only called well after the
-// whole module finishes loading; as deps threaded through a construction call,
-// they can't be referenced before their const declarations are reached.
+// comes from there) even though these functions' original source-text location
+// was earlier in the file -- as plain hoisted function declarations they could
+// close over those names before they were assigned, since they're only called
+// well after the whole module finishes loading; as deps threaded through a
+// construction call, they can't be referenced before their const declarations
+// are reached.
 
 function createResumeQueueExecutionDecisions(deps = {}) {
     const {
@@ -21,10 +22,7 @@ function createResumeQueueExecutionDecisions(deps = {}) {
         incrementQueueWakeupMetric,
         finishQueueWakeupMetricCycle,
         COORDINATOR_PAUSED_KEY,
-        COORDINATOR_QUEUE_KEY,
         queueRuntime,
-        normalizeRawCoordinatorQueueForReconcileFallback,
-        normalizeCoordinatorMap,
         getCoordinatorQueueWorkCounts
     } = deps.handlers || {}
 
@@ -68,17 +66,6 @@ function createResumeQueueExecutionDecisions(deps = {}) {
             (Number.parseInt(applyResult?.fillResult?.active, 10) || 0) <= 0 &&
             (Number.parseInt(applyResult?.fillResult?.openedTabs, 10) || 0) <= 0 &&
             (Number.parseInt(applyResult?.fillResult?.recoveredLiveTabs, 10) || 0) <= 0
-    }
-
-    function decideResumeRawQueueFallbackItems(params = {}) {
-        const {rawQueueState} = params
-        const rawQueue = rawQueueState?.[COORDINATOR_PAUSED_KEY] === true
-            ? {}
-            : normalizeRawCoordinatorQueueForReconcileFallback(
-                normalizeCoordinatorMap(rawQueueState?.[COORDINATOR_QUEUE_KEY] || {})
-            )
-        const pendingRawItems = Object.values(rawQueue).filter(item => `${item?.status || ''}`.trim() === 'queued')
-        return {rawQueue, pendingRawItems}
     }
 
     function decideResumeWalQueueFallbackItems(params = {}) {
@@ -151,7 +138,6 @@ function createResumeQueueExecutionDecisions(deps = {}) {
         decideResumeCoordinatorStoredPausedOutcome,
         decideResumeShouldRevalidateFillOutcome,
         decideResumeShouldUseFallbackOutcome,
-        decideResumeRawQueueFallbackItems,
         decideResumeWalQueueFallbackItems,
         decideResumeCoordinatorQueueExecutionOnceOutcome
     }

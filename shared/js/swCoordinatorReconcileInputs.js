@@ -95,6 +95,9 @@ function createCoordinatorReconcileInputs(deps = {}) {
 
     function markQueuedTabDurablyActive(tabId, reason = '') {
         const metadata = getQueuedTabMetadata(tabId)
+        // No runtime metadata means the tab was already released, or never tracked. Marking it would create metadata for a dead
+        // tab, which the sweeps then read as live runtime. A caller that awaits before marking can see this happen.
+        if(!metadata) return
         const durableActiveAt = Number.isFinite(metadata?.durableActiveAt) && metadata.durableActiveAt > 0
             ? metadata.durableActiveAt
             : getNow()

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Regenerates the sw.js top-level function inventory used by
-// sw-state-machine-decomposition-plan-2026-09-01.md to size and pick the
+// historical/sw-state-machine-decomposition-plan-2026-09-01.md to size and pick the
 // next extraction slice. Bucket assignment is a naming-convention guess,
 // not a verified classification -- read the function before trusting its
 // bucket.

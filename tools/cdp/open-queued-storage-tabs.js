@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
+// The stored name of the queue: the layout prefix plus the plain key name (storageNamespace.js).
+const QUEUE_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`
+
 const {
     evaluate,
     getCdpConfig,
@@ -40,7 +45,7 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function openQueuedStorageTabs(needle, limit) {
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function openQueuedStorageTabs(needle, limit, queueKey) {
         function normalizeProfile(value) {
             try {
                 const url = new URL(`${value || ''}`)
@@ -54,8 +59,8 @@ runMain(async () => {
             }
         }
 
-        const storage = await chrome.storage.local.get({mbCoordinatorQueue: {}})
-        const queue = storage.mbCoordinatorQueue || {}
+        const storage = await chrome.storage.local.get({[queueKey]: {}})
+        const queue = storage[queueKey] || {}
         const selected = []
 
         for(const [key, item] of Object.entries(queue)) {
@@ -98,14 +103,14 @@ runMain(async () => {
         }
 
         if(opened.length) {
-            await chrome.storage.local.set({mbCoordinatorQueue: queue})
+            await chrome.storage.local.set({[queueKey]: queue})
             for(const entry of opened) {
                 await chrome.tabs.update(entry.tabId, {url: entry.target, active: false})
             }
         }
 
         return {opened: opened.length, rows: opened}
-    }})( ${JSON.stringify(needle)}, ${JSON.stringify(limit)} )`, 20000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(limit)}, ${JSON.stringify(QUEUE_STORED_KEY)} )`, 20000)
 
     console.log(JSON.stringify(result, null, 2))
 })

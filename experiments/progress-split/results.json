@@ -1,0 +1,211 @@
+{
+  "samples": 200,
+  "chainSamples": 30,
+  "chainSizes": [
+    0,
+    5120,
+    102400,
+    1048576
+  ],
+  "loadBusyMs": 200,
+  "foreground": {
+    "label": "foreground",
+    "visibility": "visible",
+    "storage": {
+      "localGet100kb": {
+        "n": 200,
+        "medianMs": 0.4,
+        "p95Ms": 0.8,
+        "maxMs": 4.1
+      },
+      "localSetSmall": {
+        "n": 200,
+        "medianMs": 0.2,
+        "p95Ms": 0.4,
+        "maxMs": 3.6
+      },
+      "sessionGet100kb": {
+        "n": 200,
+        "medianMs": 0.2,
+        "p95Ms": 0.4,
+        "maxMs": 3
+      },
+      "sessionSetSmall": {
+        "n": 200,
+        "medianMs": 0.1,
+        "p95Ms": 0.3,
+        "maxMs": 2.9
+      }
+    },
+    "chain": {
+      "0B": {
+        "totalRoundTrip": {
+          "n": 30,
+          "medianMs": 0,
+          "p95Ms": 1,
+          "maxMs": 1
+        },
+        "pageAndWorker": {
+          "n": 30,
+          "medianMs": 0.1,
+          "p95Ms": 0.2,
+          "maxMs": 0.5
+        }
+      },
+      "5120B": {
+        "totalRoundTrip": {
+          "n": 30,
+          "medianMs": 0,
+          "p95Ms": 1,
+          "maxMs": 4
+        },
+        "pageAndWorker": {
+          "n": 30,
+          "medianMs": 0.1,
+          "p95Ms": 0.2,
+          "maxMs": 0.4
+        }
+      },
+      "102400B": {
+        "totalRoundTrip": {
+          "n": 30,
+          "medianMs": 1,
+          "p95Ms": 3,
+          "maxMs": 12
+        },
+        "pageAndWorker": {
+          "n": 30,
+          "medianMs": 0.2,
+          "p95Ms": 0.9,
+          "maxMs": 1.2
+        }
+      },
+      "1048576B": {
+        "totalRoundTrip": {
+          "n": 30,
+          "medianMs": 8,
+          "p95Ms": 10,
+          "maxMs": 12
+        },
+        "pageAndWorker": {
+          "n": 30,
+          "medianMs": 0.8,
+          "p95Ms": 1.2,
+          "maxMs": 1.3
+        }
+      }
+    },
+    "storageWhileWorkerBusy": {
+      "n": 30,
+      "medianMs": 0.8,
+      "p95Ms": 1.1,
+      "maxMs": 1.3
+    },
+    "storageWhileMainThreadBusy": {
+      "n": 30,
+      "medianMs": 200.2,
+      "p95Ms": 200.5,
+      "maxMs": 200.8
+    }
+  },
+  "background": {
+    "label": "background",
+    "visibility": "hidden",
+    "storage": {
+      "localGet100kb": {
+        "n": 200,
+        "medianMs": 0.3,
+        "p95Ms": 0.5,
+        "maxMs": 0.8
+      },
+      "localSetSmall": {
+        "n": 200,
+        "medianMs": 0.2,
+        "p95Ms": 0.3,
+        "maxMs": 0.3
+      },
+      "sessionGet100kb": {
+        "n": 200,
+        "medianMs": 0.2,
+        "p95Ms": 0.3,
+        "maxMs": 0.6
+      },
+      "sessionSetSmall": {
+        "n": 200,
+        "medianMs": 0.1,
+        "p95Ms": 0.2,
+        "maxMs": 0.4
+      }
+    },
+    "chain": {
+      "0B": {
+        "totalRoundTrip": {
+          "n": 30,
+          "medianMs": 0,
+          "p95Ms": 1,
+          "maxMs": 1
+        },
+        "pageAndWorker": {
+          "n": 30,
+          "medianMs": 0.1,
+          "p95Ms": 0.1,
+          "maxMs": 0.1
+        }
+      },
+      "5120B": {
+        "totalRoundTrip": {
+          "n": 30,
+          "medianMs": 0,
+          "p95Ms": 1,
+          "maxMs": 1
+        },
+        "pageAndWorker": {
+          "n": 30,
+          "medianMs": 0.1,
+          "p95Ms": 0.1,
+          "maxMs": 0.2
+        }
+      },
+      "102400B": {
+        "totalRoundTrip": {
+          "n": 30,
+          "medianMs": 1,
+          "p95Ms": 2,
+          "maxMs": 2
+        },
+        "pageAndWorker": {
+          "n": 30,
+          "medianMs": 0.1,
+          "p95Ms": 0.2,
+          "maxMs": 0.2
+        }
+      },
+      "1048576B": {
+        "totalRoundTrip": {
+          "n": 30,
+          "medianMs": 11,
+          "p95Ms": 14,
+          "maxMs": 14
+        },
+        "pageAndWorker": {
+          "n": 30,
+          "medianMs": 1.1,
+          "p95Ms": 1.5,
+          "maxMs": 1.7
+        }
+      }
+    },
+    "storageWhileWorkerBusy": {
+      "n": 30,
+      "medianMs": 0.8,
+      "p95Ms": 1.1,
+      "maxMs": 2.1
+    },
+    "storageWhileMainThreadBusy": {
+      "n": 30,
+      "medianMs": 200.3,
+      "p95Ms": 201.4,
+      "maxMs": 202.2
+    }
+  }
+}

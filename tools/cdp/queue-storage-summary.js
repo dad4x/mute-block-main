@@ -1,10 +1,31 @@
 #!/usr/bin/env node
 
 const {
+    COORDINATOR_PAUSED_KEY,
+    COORDINATOR_QUEUE_KEY,
+    COORDINATOR_QUEUE_VIEW_KEY,
+    COORDINATOR_RUNS_KEY,
+    STORAGE_LAYOUT_PREFIX
+} = require('../../shared/js/storageKeys')
+
+// No shared module declares this key any more (nothing writes it), so storageKeys.js has no constant for it.
+const IDLE_RETRY_KEY = 'mbCoordinatorIdleRetryEnabled'
+
+// The stored names this tool reads: the layout prefix plus the plain key name (storageNamespace.js).
+const STORED_NAMES = {
+    queueView: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_VIEW_KEY}`,
+    queue: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`,
+    runs: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_RUNS_KEY}`,
+    paused: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_PAUSED_KEY}`,
+    idleRetry: `${STORAGE_LAYOUT_PREFIX}${IDLE_RETRY_KEY}`
+}
+
+const {
     evaluate,
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 
@@ -27,27 +48,24 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function inspectStorageQueue(needle, includeFullRead) {
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function inspectStorageQueue(needle, includeFullRead, progressRecords, names) {
         const defaults = {
-            mbCoordinatorQueueView: {},
-            mbProfileNukeProgressView: {},
-            mbCoordinatorRuns: {},
-            mbCoordinatorPaused: false,
-            mbCoordinatorIdleRetryEnabled: false
+            [names.queueView]: {},
+            [names.runs]: {},
+            [names.paused]: false,
+            [names.idleRetry]: false
         }
         if(includeFullRead) {
-            defaults.mbCoordinatorQueue = {}
+            defaults[names.queue] = {}
         }
         const storage = await chrome.storage.local.get(defaults)
-        const view = storage.mbCoordinatorQueueView && typeof storage.mbCoordinatorQueueView === 'object'
-            ? storage.mbCoordinatorQueueView
+        const view = storage[names.queueView] && typeof storage[names.queueView] === 'object'
+            ? storage[names.queueView]
             : {}
         const items = Array.isArray(view.items) ? view.items : []
-        const progressView = storage.mbProfileNukeProgressView && typeof storage.mbProfileNukeProgressView === 'object'
-            ? storage.mbProfileNukeProgressView
-            : {}
-        const queue = includeFullRead ? storage.mbCoordinatorQueue || {} : null
-        const runs = storage.mbCoordinatorRuns || {}
+        const queue = includeFullRead ? storage[names.queue] || {} : null
+        const runs = storage[names.runs] || {}
         const matchesNeedle = item => {
             if(!needle) return true
             return [
@@ -133,13 +151,13 @@ runMain(async () => {
             runs: runRows.slice(0, 40),
             totalQueue: includeFullRead ? Object.keys(queue).length : Number.parseInt(view.total, 10) || items.length,
             totalRuns: Object.keys(runs).length,
-            totalProgress: Number.parseInt(progressView.total, 10) || Object.keys(progressView.records || {}).length,
+            totalProgress: Object.keys(progressRecords).length,
             truncated: view.truncated === true,
             fullStorageRead: includeFullRead,
-            paused: storage.mbCoordinatorPaused === true,
-            idleRetryEnabled: storage.mbCoordinatorIdleRetryEnabled === true
+            paused: storage[names.paused] === true,
+            idleRetryEnabled: storage[names.idleRetry] === true
         }
-    }})( ${JSON.stringify(needle)}, ${JSON.stringify(includeFull)} )`, includeFull ? 30000 : 20000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(includeFull)}, ${JSON.stringify(progressRecords)}, ${JSON.stringify(STORED_NAMES)} )`, includeFull ? 30000 : 20000)
 
     console.log(JSON.stringify(result, null, 2))
 })

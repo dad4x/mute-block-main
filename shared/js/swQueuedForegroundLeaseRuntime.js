@@ -80,7 +80,7 @@
 // mutators over already-extracted or passed-in state.
 //
 // cloneCoordinatorAuthorityValue and the createCoordinatorAuthority-adjacent
-// region, plus the queue-WAL/shadow-WAL async cluster, are explicitly out
+// region, plus the queue-WAL async cluster, are explicitly out
 // of scope for this decomposition effort (see the plan's "Boundary after
 // Slice 17" section) and are untouched here.
 

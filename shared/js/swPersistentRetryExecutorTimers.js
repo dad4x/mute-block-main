@@ -121,7 +121,7 @@ function createPersistentRetryExecutorTimers(deps = {}) {
     }
 
     function resetCoordinatorExecutorStartPromiseAfterTimeout(reason = 'executor-start-timeout') {
-        resetCoordinatorExecutorStartPromise()
+        resetCoordinatorExecutorStartPromise(reason || 'executor-start-timeout')
         incrementQueueWakeupMetric('pump.executorStartPromiseReset')
         recordCoordinatorDiagnosticEvent(
             'coordinator-executor-start-promise-reset',
@@ -139,7 +139,7 @@ function createPersistentRetryExecutorTimers(deps = {}) {
         const staleMs = COORDINATOR_IDLE_EXECUTOR_START_PROMISE_STALE_MS
         if(ageMs < staleMs) return false
 
-        resetCoordinatorExecutorStartPromise()
+        resetCoordinatorExecutorStartPromise(reason || 'executor-start-idle-stale-reset')
         incrementQueueWakeupMetric('pump.changed.clearedStaleExecutorStartPromise')
         incrementQueueWakeupMetric('pump.changed.clearedIdleStaleExecutorStartPromise')
         recordCoordinatorDiagnosticEvent(

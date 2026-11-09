@@ -125,7 +125,8 @@ test('completion for href A closes A\'s own owned tab and walks no other owned t
     assert.equal(result.ownedClosed, 1, 'A\'s owned tab is closed')
     assert.equal(browser.__tabs.has(tabA), false, 'A\'s owned tab is removed')
     assert.equal(counterDelta(before, after, 'terminalOwnedTabClose.ownedTabsWalked'), 0, 'A\'s tab was closed in the row pass, so the owned walk fetches nothing')
-    assert.equal(counterDelta(before, after, 'terminalOwnedTabClose.ownedTabsSkipped'), 1, 'B\'s owned tab is skipped without a fetch')
+    // A's tab is removed before its release now, so the owned walk also finds it gone and skips it (no fetch). B's tab is skipped too.
+    assert.equal(counterDelta(before, after, 'terminalOwnedTabClose.ownedTabsSkipped'), 2, 'A\'s and B\'s owned tabs are both skipped without a fetch')
 })
 
 test('orphan sweep closes a live tab that has no owner', async () => {
@@ -135,12 +136,28 @@ test('orphan sweep closes a live tab that has no owner', async () => {
     const {sw} = loadServiceWorkerHarness({now: NOW, browser, storage: {}})
     await sw.coordinatorAuthority.hydrate()
     browser.__tabs.set(tabC, {id: tabC, url: hrefC, windowId: 1, active: false})
+    // The queue made this tab, and its owner record is gone (the leftover case the sweep exists for).
+    sw.__testRecordQueueCreatedWorkerTab(tabC)
     sw.coordinatorAuthority.current().queue[hrefC] = makeTerminalRow(hrefC)
 
     const result = await sw.closeTerminalOwnedProfileTabs()
 
     assert.equal(browser.__tabs.has(tabC), false, 'the unowned live tab for a terminal href is closed by the unscoped pass')
     assert.ok(result.liveTabsSignaled >= 1, 'the live-href sweep reports the signaled tab')
+})
+
+test('orphan sweep leaves a live tab the user opened on a terminal href', async () => {
+    const hrefU = `${ROOT}Scope-Orphan-User`
+    const tabU = 2202
+    const browser = createFakeBrowser({})
+    const {sw} = loadServiceWorkerHarness({now: NOW, browser, storage: {}})
+    await sw.coordinatorAuthority.hydrate()
+    browser.__tabs.set(tabU, {id: tabU, url: hrefU, windowId: 1, active: false, userTab: true})
+    sw.coordinatorAuthority.current().queue[hrefU] = makeTerminalRow(hrefU)
+
+    await sw.closeTerminalOwnedProfileTabs()
+
+    assert.equal(browser.__tabs.has(tabU), true, 'a tab the queue did not make is not closed, even on a terminal href')
 })
 
 test('orphan sweep is throttled to one pass per interval', async () => {

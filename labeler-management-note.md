@@ -1,5 +1,7 @@
 # Labeler Management Note
 
+> **Status: ROADMAP** (24 Oct 2026). Future operations design for labelers (20 May). No decision. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: future operations/design context.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical
@@ -18,7 +20,7 @@ Its purpose is to examine the practical management questions around using atprot
 - whether to run one labeler or several
 - how this interacts with Quora spaces we control ourselves
 
-This note is intentionally more operational than [quora-labeler-bridge.md](/scratch/dbrower/home/src/mute-block-main/quora-labeler-bridge.md).
+This note is intentionally more operational than quora-labeler-bridge.md.
 
 ## Current Status
 

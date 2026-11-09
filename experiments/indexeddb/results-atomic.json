@@ -1,0 +1,430 @@
+{
+  "calibrationMs": [
+    252,
+    281,
+    276
+  ],
+  "commitMs": 281,
+  "outcomes": [
+    {
+      "trial": 1,
+      "delayMs": 204,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 2,
+      "delayMs": 74,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 3,
+      "delayMs": 24,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 4,
+      "delayMs": 203,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 5,
+      "delayMs": 34,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 6,
+      "delayMs": 156,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 7,
+      "delayMs": 180,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 8,
+      "delayMs": 191,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 9,
+      "delayMs": 143,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 10,
+      "delayMs": 173,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 11,
+      "delayMs": 120,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 12,
+      "delayMs": 207,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 13,
+      "delayMs": 165,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 14,
+      "delayMs": 240,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 15,
+      "delayMs": 204,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 16,
+      "delayMs": 229,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 17,
+      "delayMs": 235,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 18,
+      "delayMs": 175,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 19,
+      "delayMs": 104,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 20,
+      "delayMs": 245,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": -3,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        -3
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 21,
+      "delayMs": 306,
+      "stopped": true,
+      "replyOk": true,
+      "replyError": null,
+      "markerSeq": 21,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        21
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 22,
+      "delayMs": 75,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": 21,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        21
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 23,
+      "delayMs": 36,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": 21,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        21
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 24,
+      "delayMs": 306,
+      "stopped": true,
+      "replyOk": true,
+      "replyError": null,
+      "markerSeq": 24,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        24
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 25,
+      "delayMs": 89,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": 24,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        24
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 26,
+      "delayMs": 252,
+      "stopped": true,
+      "replyOk": true,
+      "replyError": null,
+      "markerSeq": 26,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        26
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 27,
+      "delayMs": 71,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": 26,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        26
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 28,
+      "delayMs": 155,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": 26,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        26
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 29,
+      "delayMs": 187,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": 26,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        26
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    },
+    {
+      "trial": 30,
+      "delayMs": 204,
+      "stopped": true,
+      "replyOk": false,
+      "replyError": "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      "markerSeq": 26,
+      "rowCount": 2000,
+      "distinctRowSeqs": [
+        26
+      ],
+      "consistent": true,
+      "fullOrEmpty": true
+    }
+  ]
+}

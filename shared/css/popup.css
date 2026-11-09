@@ -1,8 +1,8 @@
 body {
     margin: 0;
     font: 14px/1.4 system-ui, sans-serif;
-    background: #f7f7f8;
-    color: #1f2937;
+    background: var(--mb-grey-40);
+    color: var(--mb-grey-800);
     min-height: 100vh;
 }
 
@@ -12,8 +12,8 @@ body {
 
 .header {
     align-items: center;
-    background: #b92b27;
-    color: #fff;
+    background: var(--mb-brand-red);
+    color: var(--mb-white);
     display: flex;
     justify-content: space-between;
     padding: 10px 14px;
@@ -39,7 +39,7 @@ body {
     background: transparent;
     border: 0;
     border-radius: 999px;
-    color: #fff;
+    color: var(--mb-white);
     cursor: pointer;
     font-size: 16px;
     font-weight: 700;
@@ -50,12 +50,12 @@ body {
 }
 
 .header-close:hover {
-    background: rgba(255, 255, 255, 0.16);
+    background: rgba(var(--mb-white-rgb), 0.16);
 }
 
 .top-actions {
-    background: #fff;
-    border-bottom: 1px solid #e5e7eb;
+    background: var(--mb-white);
+    border-bottom: 1px solid var(--mb-grey-200);
     display: flex;
     gap: 8px;
     padding: 10px 14px;
@@ -70,8 +70,8 @@ body {
 }
 
 .section {
-    background: #fff;
-    border: 1px solid #e5e7eb;
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-200);
     border-radius: 8px;
     margin-bottom: 10px;
     padding: 12px;
@@ -96,21 +96,22 @@ body {
 }
 
 .hint {
-    color: #6b7280;
+    color: var(--mb-grey-500);
     font-size: 12px;
     margin-top: 2px;
 }
 
 .input {
-    border: 1px solid #d1d5db;
+    border: 1px solid var(--mb-grey-300);
     border-radius: 6px;
     padding: 6px 8px;
     width: 84px;
 }
 
+/* 1 Nov (audit): a drop-down is an action, so it is a pill. */
 .select {
-    border: 1px solid #d1d5db;
-    border-radius: 6px;
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 999px;
     padding: 6px 8px;
 }
 
@@ -132,7 +133,7 @@ body {
 .button {
     border: 0;
     border-radius: 6px;
-    color: #fff;
+    color: var(--mb-white);
     cursor: pointer;
     flex: 1;
     font-weight: 600;
@@ -140,27 +141,33 @@ body {
 }
 
 .button-primary {
-    background: #b92b27;
+    background: var(--mb-brand-red);
 }
 
 .button-primary:hover {
-    background: #a82723;
+    background: var(--mb-brand-red-dark);
 }
 
 .button-secondary {
-    background: #6b7280;
+    background: var(--mb-grey-500);
 }
 
 .button-secondary:hover {
-    background: #4b5563;
+    background: var(--mb-grey-600);
+}
+
+/* The warning above the erase-block-history button (preferences page): stronger than a hint, not an error. */
+.danger-warning {
+    color: var(--mb-red-600, var(--mb-brand-red));
+    font-weight: 600;
 }
 
 .button-danger {
-    background: #b92b27;
+    background: var(--mb-brand-red);
 }
 
 .button-danger:hover {
-    background: #a82723;
+    background: var(--mb-brand-red-dark);
 }
 
 .button-compact {
@@ -169,10 +176,10 @@ body {
 }
 
 .status {
-    background: #ecfdf3;
-    border-left: 4px solid #22c55e;
+    background: var(--mb-green-50);
+    border-left: 4px solid var(--mb-green-500);
     border-radius: 6px;
-    color: #166534;
+    color: var(--mb-green-800);
     margin-top: 10px;
     padding: 8px 10px;
 }
@@ -193,7 +200,7 @@ body {
 }
 
 .sort-label {
-    color: #6b7280;
+    color: var(--mb-grey-500);
     font-size: 12px;
     font-weight: 600;
 }
@@ -208,17 +215,17 @@ body {
 }
 
 .space-empty {
-    background: #f9fafb;
-    border: 1px dashed #d1d5db;
+    background: var(--mb-grey-50);
+    border: 1px dashed var(--mb-grey-300);
     border-radius: 8px;
-    color: #6b7280;
+    color: var(--mb-grey-500);
     padding: 12px;
     text-align: center;
 }
 
 .space-item {
-    background: #f9fafb;
-    border: 1px solid #e5e7eb;
+    background: var(--mb-grey-50);
+    border: 1px solid var(--mb-grey-200);
     border-radius: 10px;
     display: flex;
     flex-direction: column;
@@ -249,7 +256,7 @@ body {
 }
 
 .space-item-link {
-    color: #6b7280;
+    color: var(--mb-grey-500);
     font-size: 12px;
     overflow: hidden;
     text-decoration: none;
@@ -258,11 +265,12 @@ body {
 }
 
 .space-item-link:hover {
-    color: #b92b27;
+    color: var(--mb-brand-red);
 }
 
+/* 1 Nov (audit): a category label is static info, so it is a rectangle. */
 .space-item-category {
-    border-radius: 999px;
+    border-radius: 4px;
     font-size: 11px;
     font-weight: 700;
     padding: 2px 8px;
@@ -270,22 +278,22 @@ body {
 }
 
 .space-item-category--asset {
-    background: #fce8e7;
-    color: #8f201d;
+    background: var(--mb-category-asset-tint);
+    color: var(--mb-category-asset);
 }
 
 .space-item-category--neutral {
-    background: #e5e7eb;
-    color: #374151;
+    background: var(--mb-category-neutral-tint);
+    color: var(--mb-grey-700);
 }
 
 .space-item-category--target {
-    background: #e5e7eb;
-    color: #111827;
+    background: var(--mb-category-target-tint);
+    color: var(--mb-category-target-text);
 }
 
 .popup-space-segmented {
-    background: #eef0f3;
+    background: var(--mb-grey-120);
     border-radius: 999px;
     display: inline-flex;
     gap: 2px;
@@ -296,7 +304,7 @@ body {
     background: transparent;
     border: 0;
     border-radius: 999px;
-    color: #4b5563;
+    color: var(--mb-grey-600);
     cursor: pointer;
     font-size: 12px;
     font-weight: 700;
@@ -304,29 +312,29 @@ body {
 }
 
 .popup-space-button:hover {
-    background: rgba(255, 255, 255, 0.9);
-    color: #111827;
+    background: rgba(var(--mb-white-rgb), 0.9);
+    color: var(--mb-grey-900);
 }
 
 .popup-space-button--active {
-    color: #fff;
+    color: var(--mb-white);
 }
 
 .popup-space-button--asset {
-    background: #b92b27;
+    background: var(--mb-category-asset);
 }
 
 .popup-space-button--neutral {
-    background: #6b7280;
+    background: var(--mb-category-neutral);
 }
 
 .popup-space-button--target {
-    background: #111827;
+    background: var(--mb-category-target);
 }
 
 @media (min-width: 720px) {
     body {
-        background: #f4f5f7;
+        background: var(--mb-grey-page);
     }
 
     .popup {
@@ -340,10 +348,10 @@ body {
     }
 
     .header {
-        background: #fff;
-        border: 1px solid #e5e7eb;
+        background: var(--mb-white);
+        border: 1px solid var(--mb-grey-200);
         border-radius: 8px;
-        color: #1f2937;
+        color: var(--mb-grey-800);
         padding: 16px 18px;
     }
 
@@ -359,9 +367,9 @@ body {
     }
 
     .header-version {
-        background: #f3f4f6;
+        background: var(--mb-grey-100);
         border-radius: 999px;
-        color: #6b7280;
+        color: var(--mb-grey-500);
         font-weight: 700;
         padding: 4px 8px;
     }
@@ -423,5 +431,112 @@ body {
 @media (min-width: 1040px) {
     .form {
         grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+
+/* Every extension button on the preferences page flashes once when pressed (6 Nov). */
+.mb-button-press-flash {
+    animation: mb-button-press-flash var(--mb-button-press-flash-ms) ease-out;
+}
+
+@keyframes mb-button-press-flash {
+    0% {
+        filter: invert(0);
+    }
+
+    30% {
+        filter: invert(1);
+    }
+
+    100% {
+        filter: invert(0);
+    }
+}
+
+/* The standard pill, as on the dashboard and History (6 Nov): the header buttons, Save (black) and Reset (white), and the bottom bar's Pause. */
+.header-buttons {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.clear-button {
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 999px;
+    color: var(--mb-grey-700);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 7px 10px;
+}
+
+.clear-button:hover:not(:disabled) {
+    background: var(--mb-grey-50);
+}
+
+.clear-button:disabled {
+    cursor: default;
+    opacity: 0.5;
+}
+
+.clear-button.pause-toggle {
+    background: var(--mb-black);
+    border: 1px solid var(--mb-black);
+    border-radius: 999px;
+    color: var(--mb-white);
+}
+
+.clear-button.pause-toggle:hover:not(:disabled) {
+    background: var(--mb-grey-800);
+    border-color: var(--mb-grey-800);
+}
+
+/* The title, with the version as a subhead under it (6 Nov). */
+.header-main {
+    align-items: flex-start;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.header-subhead {
+    font-size: 12px;
+    opacity: 0.85;
+}
+
+/* The header brand (logo, title and version), the Quora return and the buttons (6 Nov), as on the dashboard. */
+.header-brand {
+    align-items: center;
+    display: flex;
+    gap: 10px;
+}
+
+.header-logo {
+    height: 32px;
+    width: 32px;
+}
+
+.header-status {
+    align-items: flex-end;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    gap: 6px;
+}
+
+
+/* The Quora wordmark in the header: white on the red popup header, brand red on the wide page's white header card (6 Nov). */
+.header .quora-home-link {
+    color: var(--mb-white);
+}
+
+@media (min-width: 720px) {
+    .header .quora-home-link {
+        color: var(--mb-brand-red);
     }
 }

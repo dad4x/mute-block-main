@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_WAL_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
 const {
     evaluate,
     getCdpConfig,
@@ -20,7 +22,8 @@ runMain(async () => {
         return
     }
 
-    const key = `mbCoordinatorQueueWal.checkpoint.${checkpointId}`
+    // The stored name of the checkpoint: the layout prefix plus the plain checkpoint key (storageNamespace.js).
+    const key = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_WAL_KEY}.checkpoint.${checkpointId}`
     const result = await evaluate(dashboard.webSocketDebuggerUrl, `
         new Promise(resolve => {
             chrome.storage.local.get({${JSON.stringify(key)}: null}, stored => {

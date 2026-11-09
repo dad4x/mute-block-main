@@ -3,9 +3,11 @@
 // shape/summarization layer plus its sharded storage view: the record
 // summarizer, the compact progress view builder, the shard index/key
 // helpers, the shard-defaults builders, the projection-defaults builder,
-// the shard payload builder, the nonterminal-authority predicate used to
-// filter progress out of the content-page projection, the view/shard
-// record update and removal helpers, the shard-records normalizer, the
+// the shard payload builder, the content-page projection filter (a queued
+// profile or a terminal record keeps its progress), the stored-projection
+// content comparison the door's progress repair uses to write only the keys
+// that changed, the view/shard record update and removal helpers, the
+// shard-records normalizer, the
 // records-from-projection getter, and the content-page-state projection
 // payload assembler (which composes this module's own state with
 // swCoordinatorQueueView.js's and swCoordinatorContentQueueIndex.js's
@@ -68,26 +70,17 @@ function createProfileNukeProgress(deps = {}) {
         getNormalizedProfileHrefList,
         makeProjectionShardDefaults,
         isTerminalCoordinatorStatus,
+        isTerminalProfileNukeRecord,
         getCoordinatorItemHref,
         normalizeProfileNukeProgressView,
-        normalizeCoordinatorMap,
-        makeCoordinatorQueueWalCheckpoint,
-        buildCoordinatorQueueView,
-        buildCoordinatorContentQueueIndex,
-        buildCoordinatorContentQueueIndexShardPayload,
-        buildCoordinatorContentSourceIndexShardPayload
+        buildCoordinatorQueueView
     } = deps.handlers || {}
     const {
         MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS,
         PROFILE_NUKE_PROGRESS_SHARD_COUNT,
         PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
         PROFILE_NUKE_PROGRESS_VIEW_KEY,
-        COORDINATOR_QUEUE_KEY,
-        COORDINATOR_QUEUE_WAL_KEY,
-        COORDINATOR_QUEUE_VIEW_KEY,
-        COORDINATOR_CONTENT_QUEUE_INDEX_KEY,
-        COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX,
-        COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX
+        COORDINATOR_QUEUE_VIEW_KEY
     } = deps.constants || {}
 
     function summarizeProfileNukeProgressRecord(profileHref = '', record = {}) {
@@ -95,6 +88,7 @@ function createProfileNukeProgress(deps = {}) {
         if(!href) return null
 
         const source = record && typeof record === 'object' ? record : {}
+        const generation = Number.parseInt(source.generation, 10) || 0
         return {
             profileHref: href,
             status: source.status || '',
@@ -104,6 +98,7 @@ function createProfileNukeProgress(deps = {}) {
             runId: source.runId || '',
             tabId: Number.isFinite(source.tabId) ? source.tabId : source.tabId || null,
             lastUrl: source.lastUrl || '',
+            pageVisibility: source.pageVisibility || '',
             queuedAt: Number.parseInt(source.queuedAt, 10) || 0,
             tabCreatedAt: Number.parseInt(source.tabCreatedAt, 10) || 0,
             tabOpenedAt: Number.parseInt(source.tabOpenedAt, 10) || 0,
@@ -150,7 +145,11 @@ function createProfileNukeProgress(deps = {}) {
             // dropped here, or the guard loses its stored basis for
             // comparison across a service-worker restart.
             clearedAt: Number.parseInt(source.clearedAt, 10) || 0,
-            directProgressClientUpdatedAt: Number.parseInt(source.directProgressClientUpdatedAt, 10) || 0
+            directProgressClientUpdatedAt: Number.parseInt(source.directProgressClientUpdatedAt, 10) || 0,
+            // Set by the write door on every upsert (sw.js applyCoordinatorProgressDeltas). Kept in both the view
+            // entry and the shard entry. Records written before generations existed have none, so the key is left
+            // out rather than written as 0.
+            ...(generation > 0 ? {generation} : {})
         }
     }
 
@@ -259,14 +258,59 @@ function createProfileNukeProgress(deps = {}) {
         })
     }
 
+    // A record is kept when its profile is queued (hasNonterminalCoordinatorAuthorityForProfile: a nonterminal queue row)
+    // or when the record itself is terminal (isTerminalProfileNukeRecord, the record-level predicate). Any other record,
+    // for example an in-flight action for a profile that is not queued, is dropped.
     function filterProfileNukeProgressForContentProjection(progress = {}, queue = {}) {
         const normalized = normalizeStoredProfileNukeProgress(progress || {})
         const filtered = {}
         for(const [profileHref, record] of Object.entries(normalized)) {
-            if(hasNonterminalCoordinatorAuthorityForProfile(queue, profileHref)) continue
+            if(!hasNonterminalCoordinatorAuthorityForProfile(queue, profileHref) &&
+                !isTerminalProfileNukeRecord(record)) continue
             filtered[profileHref] = record
         }
         return filtered
+    }
+
+    // Canonical JSON for comparing projection values: object keys sorted at every depth, undefined members left out, so
+    // two values with the same content give the same string whatever their key order.
+    function stableProfileNukeProgressProjectionJson(value) {
+        if(Array.isArray(value)) return `[${value.map(stableProfileNukeProgressProjectionJson).join(',')}]`
+        if(value && typeof value === 'object') {
+            return `{${Object.keys(value)
+                .filter(key => value[key] !== undefined)
+                .sort()
+                .map(key => `${JSON.stringify(key)}:${stableProfileNukeProgressProjectionJson(value[key])}`)
+                .join(',')}}`
+        }
+        return JSON.stringify(value === undefined ? null : value)
+    }
+
+    // The content of a progress view or shard: its own updatedAt and each record's updatedAt are left out. A timestamp is
+    // not content. normalizeStoredProfileNukeProgress (swProfileProgressMerge.js) sets every record's updatedAt to now(),
+    // so a derived value always carries new timestamps and could never equal the stored one.
+    function getProfileNukeProgressProjectionContent(value) {
+        if(!value || typeof value !== 'object' || Array.isArray(value)) return value
+        const content = {...value}
+        delete content.updatedAt
+        if(content.records && typeof content.records === 'object' && !Array.isArray(content.records)) {
+            content.records = Object.fromEntries(Object.entries(content.records).map(([profileHref, record]) => {
+                if(!record || typeof record !== 'object' || Array.isArray(record)) return [profileHref, record]
+                const recordContent = {...record}
+                delete recordContent.updatedAt
+                return [profileHref, recordContent]
+            }))
+        }
+        return content
+    }
+
+    // The keys of derived (a progress view and the shard payload, as buildProfileNukeProgressView and
+    // buildProfileNukeProgressShardPayload build them) whose content differs from stored[key]. A missing stored value
+    // differs from every derived value. Timestamps are ignored (getProfileNukeProgressProjectionContent).
+    function getChangedProfileNukeProgressProjectionKeys(stored = {}, derived = {}) {
+        return Object.keys(derived || {}).filter(key =>
+            stableProfileNukeProgressProjectionJson(getProfileNukeProgressProjectionContent(stored?.[key])) !==
+            stableProfileNukeProgressProjectionJson(getProfileNukeProgressProjectionContent(derived[key])))
     }
 
     function updateProfileNukeProgressViewRecords(view = null, progressRecords = {}, nowMs = now()) {
@@ -391,49 +435,6 @@ function createProfileNukeProgress(deps = {}) {
         return progress
     }
 
-    function addContentPageStateProjectionPayload(payload = {}) {
-        if(!payload || typeof payload !== 'object') return payload
-        const next = {
-            ...payload
-        }
-        const nowMs = now()
-        if(
-            Object.prototype.hasOwnProperty.call(next, COORDINATOR_QUEUE_KEY) &&
-            next[COORDINATOR_QUEUE_KEY] &&
-            typeof next[COORDINATOR_QUEUE_KEY] === 'object'
-        ) {
-            const queue = normalizeCoordinatorMap(next[COORDINATOR_QUEUE_KEY])
-            if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_QUEUE_WAL_KEY)) {
-                next[COORDINATOR_QUEUE_WAL_KEY] = makeCoordinatorQueueWalCheckpoint(queue, {createdAt: nowMs})
-            }
-            // 2026-10-02: used to also inject a freshly-built
-            // COORDINATOR_QUEUE_VIEW_KEY here unconditionally on every full-
-            // queue write -- missed during the 2026-10-01 "remove all on-disk
-            // mbCoordinatorQueueView persistence" work (this call site isn't
-            // near any of the other projection-payload builders that work
-            // touched). That kept the disk key perpetually re-populated with
-            // whatever queue shape happened to be writing at that moment --
-            // not the ratcheted/statsClearedAt-filtered view the rest of the
-            // app expects -- which the WAL's auto-recovery-from-view path
-            // (since retired -- see LEGACY_QUEUE_VIEW_RETIREMENT.md) then read back
-            // in as "the truth" on the next hydrate failure, reintroducing
-            // old/mismatched row states on top of a live WAL that had since
-            // moved on. Confirmed live: reappearing rows and up to 3
-            // concurrently active tabs right after a
-            // coordinator-authority-queue-wal-auto-recovered-from-view event.
-            if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_CONTENT_QUEUE_INDEX_KEY)) {
-                next[COORDINATOR_CONTENT_QUEUE_INDEX_KEY] = buildCoordinatorContentQueueIndex(queue, nowMs)
-            }
-            if(!Object.keys(next).some(key => `${key || ''}`.startsWith(COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX))) {
-                Object.assign(next, buildCoordinatorContentQueueIndexShardPayload(queue, nowMs))
-            }
-            if(!Object.keys(next).some(key => `${key || ''}`.startsWith(COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX))) {
-                Object.assign(next, buildCoordinatorContentSourceIndexShardPayload(queue, nowMs))
-            }
-        }
-        return next
-    }
-
     return {
         summarizeProfileNukeProgressRecord,
         buildProfileNukeProgressView,
@@ -446,13 +447,13 @@ function createProfileNukeProgress(deps = {}) {
         buildProfileNukeProgressShardPayload,
         hasNonterminalCoordinatorAuthorityForProfile,
         filterProfileNukeProgressForContentProjection,
+        getChangedProfileNukeProgressProjectionKeys,
         updateProfileNukeProgressViewRecords,
         updateProfileNukeProgressShardRecord,
         removeProfileNukeProgressViewRecords,
         removeProfileNukeProgressShardRecords,
         normalizeProfileNukeProgressShardRecords,
-        getProfileNukeProgressRecordsFromProjection,
-        addContentPageStateProjectionPayload
+        getProfileNukeProgressRecordsFromProjection
     }
 }
 

@@ -1,5 +1,7 @@
 # Browser Upgrade Regression
 
+> **Status: ROADMAP** (24 Oct 2026). Browser upgrade regression plan (10 Jun). The regression tool exists; no live run is recorded in the plan. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 ## Goal
 
 Validate the fresh Chrome profile that started from Chrome Web Store Mute Block
@@ -20,19 +22,7 @@ step needs visible browser UI or user credentials. The prompt must be present
 in Codex output and in the JSON report as `operatorIntervention`, and every
 prompt must begin with this exact prefix:
 
-```text
->>>>>> OPERATOR INTERVENTION: do ...
-```
-
 Known intervention prompts:
-
-```text
->>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select C:\Users\DBROWER\Documents\src\mute-block-main\chrome-unpacked-current, and report the listed extension ID/version or the exact visible Chrome error text.
-```
-
-```text
->>>>>> OPERATOR INTERVENTION: do sign in to Quora in the visible regression Chrome profile, then rerun the requested non-work-starting smoke.
-```
 
 The manual Load unpacked prompt is expected when Chrome has not registered the
 keyed current build under `nlmmkoljofpgbmlcojebolmniineboah`. Do not work
@@ -60,8 +50,7 @@ For shell-level CDP health checks, always bypass proxy configuration:
 timeout 10 curl --noproxy '*' -sS http://127.0.0.1:9223/json/version
 ```
 
-Plain `curl` can time out through proxy settings even when the reverse tunnel
-and Windows Chrome are healthy. The repo CDP runners use direct Node `http`
+Plain `curl` can time out through proxy settings even when Windows Chrome is healthy. The repo CDP runners use direct Node `http`
 requests and do not need the curl flag.
 
 ```bash
@@ -315,11 +304,6 @@ Do not run Phase 5 against a local unpacked ID such as
 `gjjabgpgjpampikjhjpfhneeoapjbjaf`; that tests a separate extension identity,
 not the store-upgrade path.
 
-On the WINDOWS-HOST Windows laptop, launch the visible regression browser in
-the logged-in console session. Plain SSH can create an invisible session-0
-Chrome, so use an interactive scheduled task or another session-1 launch path
-and verify the process is in Windows Console session `1`.
-
 Use a load-only extension launch:
 
 ```text
@@ -337,10 +321,6 @@ If the keyed extension is absent from `chrome://extensions` or CDP does not
 show a service worker under
 `chrome-extension://nlmmkoljofpgbmlcojebolmniineboah/`, stop and prompt the
 operator:
-
-```text
->>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select C:\Users\DBROWER\Documents\src\mute-block-main\chrome-unpacked-current, and report the listed extension ID/version or the exact visible Chrome error text.
-```
 
 After manual load, the expected extension registry facts are:
 
@@ -412,10 +392,6 @@ alarms.
 
 If the page reaches a Quora login wall, the runner must report the standard
 operator prompt:
-
-```text
->>>>>> OPERATOR INTERVENTION: do sign in to Quora in the visible regression Chrome profile, then rerun the requested non-work-starting smoke.
-```
 
 ## Phase 7 Discovery Reload Stability Smoke
 

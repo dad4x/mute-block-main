@@ -33,7 +33,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const clearProfileNukeState = requireQueueMachineCapability('durable', durable, 'clearProfileNukeState')
     const enqueueCoordinatorItemsStorageLocked = requireQueueMachineCapability('durable', durable, 'enqueueCoordinatorItemsStorageLocked')
     const markQueuedProfileResolutionUnresolved = requireQueueMachineCapability('durable', durable, 'markQueuedProfileResolutionUnresolved')
-    const confirmSpaceFeedProfilesBlocked = requireQueueMachineCapability('durable', durable, 'confirmSpaceFeedProfilesBlocked')
     const mutateCoordinatorQueuedTabActiveTransition = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorQueuedTabActiveTransition')
     const mutateCoordinatorQueuedTabOpenRollback = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorQueuedTabOpenRollback')
     const mutateCoordinatorInitialBlockedState = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorInitialBlockedState')
@@ -41,7 +40,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const mutateCoordinatorActionLeaseRelease = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorActionLeaseRelease')
     const mutateCoordinatorActionLeaseRequest = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorActionLeaseRequest')
     const mutateCoordinatorActionLeasesForTabRelease = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorActionLeasesForTabRelease')
-    const mutateCoordinatorFailedItemsRequeue = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorFailedItemsRequeue')
     const mutateCoordinatorFailedItemsRetry = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorFailedItemsRetry')
     const mutateCoordinatorKeyOnlyItemTerminate = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorKeyOnlyItemTerminate')
     const mutateCoordinatorPauseStateSet = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorPauseStateSet')
@@ -49,8 +47,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const recordActiveBlockedLiveTabTerminal = requireQueueMachineCapability('durable', durable, 'recordActiveBlockedLiveTabTerminal')
     const recordCoordinatorJobProgress = requireQueueMachineCapability('durable', durable, 'recordCoordinatorJobProgress')
     const recordOwnedBlockedSweepTerminal = requireQueueMachineCapability('durable', durable, 'recordOwnedBlockedSweepTerminal')
-    const removePendingSpaceFeedEntries = requireQueueMachineCapability('durable', durable, 'removePendingSpaceFeedEntries')
-    const removePendingSpaceFeedUrls = requireQueueMachineCapability('durable', durable, 'removePendingSpaceFeedUrls')
     const recoverExhaustedRolledBackQueuedCoordinatorItem = requireQueueMachineCapability('durable', durable, 'recoverExhaustedRolledBackQueuedCoordinatorItem')
     const requeueDurableActiveCoordinatorItemWithoutActor = requireQueueMachineCapability('durable', durable, 'requeueDurableActiveCoordinatorItemWithoutActor')
     const settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor = requireQueueMachineCapability('durable', durable, 'settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor')
@@ -59,6 +55,7 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const mutateCoordinatorStaleRetryQueuedTabAdvance = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStaleRetryQueuedTabAdvance')
     const mutateCoordinatorStoredWorkCancel = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkCancel')
     const mutateCoordinatorStoredWorkClear = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkClear')
+    const mutateCoordinatorStoredWorkFailedItemRemove = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkFailedItemRemove')
     const mutateCoordinatorStoredWorkItemCancel = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkItemCancel')
     const mutateCoordinatorStoredWorkPause = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkPause')
     const terminateDurableActiveCoordinatorItemFromTerminalProgress = requireQueueMachineCapability('durable', durable, 'terminateDurableActiveCoordinatorItemFromTerminalProgress')
@@ -136,15 +133,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
         },
         [QUEUE_MACHINE_EVENT_TYPES.TERMINAL_COORDINATOR_ITEMS_SETTLE]: async (event = {}) => {
             return settleTerminalCoordinatorItems(event.options || {})
-        },
-        [QUEUE_MACHINE_EVENT_TYPES.PENDING_SPACE_FEED_URLS_REMOVE]: async (event = {}) => {
-            return removePendingSpaceFeedUrls(event.urls || [])
-        },
-        [QUEUE_MACHINE_EVENT_TYPES.PENDING_SPACE_FEED_ENTRIES_REMOVE]: async (event = {}) => {
-            return removePendingSpaceFeedEntries(event.postKeys || [])
-        },
-        [QUEUE_MACHINE_EVENT_TYPES.SPACE_FEED_PROFILES_CONFIRM]: async (event = {}) => {
-            return confirmSpaceFeedProfilesBlocked(event.profileHrefs || event.urls || [])
         },
         [QUEUE_MACHINE_EVENT_TYPES.BLOCKED_LIVE_TAB_TERMINAL_RECORD]: async (event = {}) => {
             return recordActiveBlockedLiveTabTerminal(
@@ -245,6 +233,12 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
             return mutateCoordinatorStoredWorkCancel({
                 reason: operation.reason || 'ordinaryMutation',
                 cancelReason: event.cancelReason || event.reason || 'coordinator-pause-request'
+            })
+        },
+        [QUEUE_MACHINE_EVENT_TYPES.REMOVE_FAILED_STORED_WORK_ITEM]: async (event = {}, operation = {}) => {
+            return mutateCoordinatorStoredWorkFailedItemRemove({
+                reason: operation.reason || 'ordinaryMutation',
+                rowKey: event.rowKey || ''
             })
         },
         [QUEUE_MACHINE_EVENT_TYPES.CANCEL_STORED_WORK_ITEM]: async (event = {}, operation = {}) => {
@@ -443,12 +437,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
                 event.metadata || null,
                 event.options || {}
             )
-        },
-        [QUEUE_MACHINE_EVENT_TYPES.REQUEUE_FAILED_ITEMS]: async (event = {}, operation = {}) => {
-            return mutateCoordinatorFailedItemsRequeue({
-                reason: operation.reason || 'ordinaryMutation',
-                request: event.request || {}
-            })
         },
         [QUEUE_MACHINE_EVENT_TYPES.RETRY_FAILED_ITEMS]: async (event = {}, operation = {}) => {
             return mutateCoordinatorFailedItemsRetry({

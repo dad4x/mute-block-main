@@ -10,3 +10,6 @@ firefox
 tmp/upgrade-regression/
 tmp/mix-shared/
 .fallow/
+
+# Local browser profiles and diagnostics (hundreds of MB, not source)
+experiments/worker-host/

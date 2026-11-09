@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
+// The stored name of the queue: the layout prefix plus the plain key name (storageNamespace.js).
+const QUEUE_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`
+
 const {
     evaluate,
     getCdpConfig,
@@ -39,9 +44,9 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function requeueStaleActive(needle) {
-        const storage = await chrome.storage.local.get({mbCoordinatorQueue: {}})
-        const queue = storage.mbCoordinatorQueue || {}
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function requeueStaleActive(needle, queueKey) {
+        const storage = await chrome.storage.local.get({[queueKey]: {}})
+        const queue = storage[queueKey] || {}
         const now = Date.now()
         const changed = []
 
@@ -70,9 +75,9 @@ runMain(async () => {
             changed.push(key)
         }
 
-        await chrome.storage.local.set({mbCoordinatorQueue: queue})
+        await chrome.storage.local.set({[queueKey]: queue})
         return {changed: changed.length, rows: changed}
-    }})( ${JSON.stringify(needle)} )`, 20000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(QUEUE_STORED_KEY)} )`, 20000)
 
     console.log(JSON.stringify(result, null, 2))
 })

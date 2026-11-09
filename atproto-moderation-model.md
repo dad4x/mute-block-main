@@ -1,5 +1,7 @@
 # atproto Moderation Model Notes for `mute-block-main`
 
+> **Status: ROADMAP** (24 Oct 2026). Design context for a future publication model on atproto. Not planned for the current line. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: research/design context.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

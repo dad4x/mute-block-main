@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_RUNS_KEY, STORAGE_LAYOUT_PREFIX} = require("../../shared/js/storageKeys")
 const {evaluate, getCdpConfig, getOption, getTargets, runMain} = require('./lib/cdp')
+
+// The stored names of the queue and the run list: the layout prefix plus the plain key name (storageNamespace.js).
+const QUEUE_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`
+const RUNS_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_RUNS_KEY}`
 
 runMain(async () => {
     const config = getCdpConfig()
@@ -39,17 +44,10 @@ runMain(async () => {
 
     let workerResult = null
     if(serviceWorker) {
-        workerResult = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectWorker(needle) {
-            const storage = await chrome.storage.local.get({
-                mbSpacePendingNukedPosts: {},
-                mbCoordinatorQueue: {},
-                mbCoordinatorRuns: {},
-                mbProfileNukeProgressView: {}
-            })
-            const pending = storage.mbSpacePendingNukedPosts || {}
-            const queue = storage.mbCoordinatorQueue || {}
-            const runs = storage.mbCoordinatorRuns || {}
-            const progress = storage.mbProfileNukeProgressView?.records || {}
+        workerResult = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectWorker(needle, queueKey, runsKey) {
+            const storage = await chrome.storage.local.get([queueKey, runsKey])
+            const queue = storage[queueKey] || {}
+            const runs = storage[runsKey] || {}
             const tabs = await chrome.tabs.query({})
             const spaceTabs = tabs
                 .filter(tab => `${tab.url || ''}\n${tab.title || ''}`.toLowerCase().includes(needle))
@@ -60,18 +58,6 @@ runMain(async () => {
                     title: tab.title || '',
                     url: tab.url || ''
                 }))
-            const pendingForNeedle = Object.entries(pending)
-                .filter(([, record]) => `${record?.spaceUrl || ''}\n${record?.spaceKey || ''}`.toLowerCase().includes(needle))
-                .map(([postKey, record]) => ({
-                    postKey,
-                    spaceKey: record.spaceKey || '',
-                    spaceUrl: record.spaceUrl || '',
-                    remaining: Array.isArray(record.remainingUrls) ? record.remainingUrls.length : 0,
-                    remainingUrls: Array.isArray(record.remainingUrls) ? record.remainingUrls : [],
-                    jobKeys: Array.isArray(record.jobKeys) ? record.jobKeys : [],
-                    jobKeysByProfileHref: record.jobKeysByProfileHref || {},
-                    resolverPending: record.resolverPending === true
-                }))
             const queueBySource = Object.entries(queue)
                 .filter(([, item]) => `${item?.source?.pageUrl || ''}\n${item?.source?.spaceKey || ''}`.toLowerCase().includes(needle))
                 .map(([key, item]) => ({
@@ -81,12 +67,6 @@ runMain(async () => {
                     sourcePage: item?.source?.pageUrl || '',
                     runId: item.runId || ''
                 }))
-            const pendingHrefs = new Set(pendingForNeedle.flatMap(record => record.remainingUrls || []))
-            const pendingHrefDetails = Array.from(pendingHrefs).map(href => ({
-                href,
-                queue: queue[href] || null,
-                progress: progress[href] || null
-            }))
             const owned = spaceTabs.map(tab => {
                 const ownedIds = Array.from((typeof ownedTabIdsByParent !== 'undefined' && ownedTabIdsByParent.get(tab.id)) || [])
                 const active = typeof activeQueuedTabs !== 'undefined'
@@ -105,17 +85,14 @@ runMain(async () => {
             })
             return {
                 spaceTabs,
-                pendingForNeedle,
-                pendingHrefDetails,
                 queueBySource,
                 owned,
                 counts: {
-                    pendingPosts: Object.keys(pending).length,
                     queue: Object.keys(queue).length,
                     runs: Object.keys(runs).length
                 }
             }
-        }})( ${JSON.stringify(needle)} )`)
+        }})( ${JSON.stringify(needle)}, ${JSON.stringify(QUEUE_STORED_KEY)}, ${JSON.stringify(RUNS_STORED_KEY)} )`)
     }
 
     console.log(JSON.stringify({needle, pageCount: pages.length, pageResults, workerResult}, null, 2))

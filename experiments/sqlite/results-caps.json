@@ -1,0 +1,34 @@
+{
+  "serviceWorker": {
+    "bootId": "4f316941-f389-4ce8-8d28-15354c6732c4",
+    "hasWorkerCtor": "undefined",
+    "hasGetDirectory": "function",
+    "hasSyncAccessHandleProto": "undefined",
+    "crossOriginIsolated": false,
+    "hasSharedArrayBuffer": "function",
+    "syncAccessHandleInServiceWorker": "TypeError: handle.createSyncAccessHandle is not a function"
+  },
+  "offscreen": {
+    "crossOriginIsolated": false,
+    "hasSharedArrayBuffer": "function",
+    "hasWorker": "function"
+  },
+  "sahpoolOpen": {
+    "ok": true,
+    "libVersion": "3.53.4",
+    "hasOpfsVfs": true,
+    "hasSahpoolVfs": true,
+    "vfs": "opfs-sahpool",
+    "filename": "/spike-sahpool.sqlite3",
+    "journalMode": "delete"
+  },
+  "opfsVfsOpen": {
+    "ok": true,
+    "libVersion": "3.53.4",
+    "hasOpfsVfs": true,
+    "hasSahpoolVfs": true,
+    "vfs": "opfs",
+    "filename": "/spike-opfs.sqlite3",
+    "journalMode": "delete"
+  }
+}

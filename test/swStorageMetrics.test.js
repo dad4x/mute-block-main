@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict')
-const {createStorageMetrics} = require('../shared/js/swStorageMetrics')
+const {createStorageMetrics, startEventLoopLagSampler} = require('../shared/js/swStorageMetrics')
 
 function test(name, fn) {
     try {
@@ -30,8 +30,6 @@ function makeMetrics() {
             QUEUE_WAKEUP_METRICS_VIEW_KEY: 'mbQueueWakeupMetricsView',
             PROFILE_NUKE_PROGRESS_VIEW_KEY: 'mbProfileNukeProgressView',
             PROFILE_NUKE_PROGRESS_SHARD_PREFIX: 'mbProfileNukeProgressShard.',
-            SPACE_PENDING_NUKED_POSTS_KEY: 'mbSpacePendingNukedPosts',
-            SPACE_NUKED_POSTS_KEY: 'mbSpaceNukedPosts',
             OWNED_TAB_STATE_KEY: 'mbOwnedTabState',
             COORDINATOR_PAUSED_KEY: 'mbCoordinatorPaused',
             COORDINATOR_PAUSE_GENERATION_KEY: 'mbCoordinatorPauseGeneration',
@@ -130,4 +128,70 @@ test('a cache miss (different queue object) still computes correct, independent 
 
     assert.ok(bytesA > 0 && bytesB > 0)
     assert.ok(bytesB > bytesA, 'the larger queue must report a larger byte size, not a cached smaller one')
+})
+
+test('a physical write records its time in its size bucket, with calls, sum and max', () => {
+    const {metrics, counters, maxCounters} = makeMetrics()
+    metrics.recordPhysicalWriteMetrics(500, 250)
+    metrics.recordPhysicalWriteMetrics(600, 40)
+    assert.equal(counters['storagePhysical.writeMs.lt1k.100_300ms'], 1)
+    assert.equal(counters['storagePhysical.writeMs.lt1k.10_50ms'], 1)
+    assert.equal(counters['storagePhysical.writeMs.lt1k.calls'], 2)
+    assert.equal(counters['storagePhysical.writeMs.lt1k.sumMs'], 290)
+    assert.equal(maxCounters['storagePhysical.writeMs.lt1k.maxMs'], 250)
+    assert.equal(counters['storagePhysical.write.size.lt1k'], 2)
+})
+
+test('a physical write without a time still counts its size but adds no latency', () => {
+    const {metrics, counters} = makeMetrics()
+    metrics.recordPhysicalWriteMetrics(2000)
+    assert.equal(counters['storagePhysical.write.size.1k_4k'], 1)
+    assert.equal(counters['storagePhysical.writeMs.1k_4k.calls'], undefined)
+})
+
+test('a write of 4 MB or more lands in the ge4m size bucket and the ge1000ms latency bucket', () => {
+    const {metrics, counters} = makeMetrics()
+    metrics.recordPhysicalWriteMetrics(5 * 1024 * 1024, 1500)
+    assert.equal(counters['storagePhysical.writeMs.ge4m.ge1000ms'], 1)
+})
+
+test('slow writes started close together form one cluster; a gap starts a new one', () => {
+    const {metrics} = makeMetrics()
+    assert.deepEqual(metrics.noteStorageWriteTiming(1000, 50), {sinceLastSlowWriteMs: null, slowWriteClusterSize: 0})
+    assert.deepEqual(metrics.noteStorageWriteTiming(10000, 900), {sinceLastSlowWriteMs: null, slowWriteClusterSize: 1})
+    assert.deepEqual(metrics.noteStorageWriteTiming(10500, 400), {sinceLastSlowWriteMs: 500, slowWriteClusterSize: 2})
+    assert.deepEqual(metrics.noteStorageWriteTiming(20000, 350), {sinceLastSlowWriteMs: 9500, slowWriteClusterSize: 1})
+})
+
+test('the event-loop lag sampler does nothing under Node', () => {
+    let intervalCreated = false
+    const stop = startEventLoopLagSampler({setIntervalFn() { intervalCreated = true; return 1 }})
+    assert.equal(typeof stop, 'function')
+    stop()
+    assert.equal(intervalCreated, false)
+})
+
+test('the event-loop lag sampler records a stall only when a tick is late by the threshold', () => {
+    const events = []
+    let tick = null
+    let clock = 0
+    const stop = startEventLoopLagSampler({
+        inWorker: true,
+        intervalMs: 50,
+        stallMs: 100,
+        now: () => clock,
+        setIntervalFn: fn => { tick = fn; return 7 },
+        clearIntervalFn: id => { events.push({cleared: id}) },
+        recordFlightRecorderEvent: entry => events.push(entry)
+    })
+    clock = 50
+    tick()
+    clock = 100
+    tick()
+    assert.equal(events.length, 0, 'ticks on time record nothing')
+    clock = 300
+    tick()
+    assert.deepEqual(events, [{kind: 'event-loop-stall', lagMs: 150, at: 300}])
+    stop()
+    assert.deepEqual(events[1], {cleared: 7})
 })
