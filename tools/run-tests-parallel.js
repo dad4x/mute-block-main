@@ -19,6 +19,7 @@ const lanes = [
       ['node', 'test/spaceFeedCitedLink.test.js'],
       ['node', 'test/spaceFeedQueuedCandidateBusy.test.js'],
       ['node', 'test/spaceFeedPostButtonNoDropdown.test.js'],
+      ['node', 'test/blockedCloseTabDeferral.test.js'],
       ['node', 'test/spaceFeedBannedLabel.test.js'],
       ['node', 'test/spaceFeedAnswerChaseUrl.test.js'],
       ['node', 'test/queuedTabNotFound.test.js'],

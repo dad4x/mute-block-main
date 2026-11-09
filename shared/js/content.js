@@ -5638,8 +5638,11 @@ async function waitForProfileActionReady(timeoutMs = WAIT_FOR_PROFILE_ACTION_REA
     return waitForCondition(() => isProfileBlocked() || !!getProfileMenuButton(), timeoutMs, 100)
 }
 
+// A blocked profile page shows Close tab, so a tab the user opened keeps it (owner, 8 Nov: it was lost on blocked pages). The button waits
+// only while the queue is driving this tab: an action is claimed or running here, or a queue row for this profile is still pending.
 function shouldDeferBlockedCloseTab(target) {
-    return isProfileBlocked() && target?.type !== 'before-menu'
+    if(target?.type === 'before-menu' || !isProfileBlocked()) return false
+    return autoProfileActionPending || autoProfileAction != null || hasCurrentProfilePendingCoordinatorQueueItem()
 }
 
 function insertProfileActionButton(btn, target, kind) {
